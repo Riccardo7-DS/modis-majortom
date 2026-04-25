@@ -1671,7 +1671,7 @@ class EarthAccessDownloader:
         """
         import pickle
         from tqdm import tqdm
-        from transform.majortom import CalculationsMajorTom
+        from ..transform.majortom import CalculationsMajorTom
         calculations = CalculationsMajorTom()
         tile_lookup = {}
 
@@ -1748,7 +1748,7 @@ class EarthAccessDownloader:
             reference_band=None):
 
         if majortom_grid:
-            from transform import CalculationsMajorTom
+            from ..transform.majortom import CalculationsMajorTom
             self.calculations =  CalculationsMajorTom(pixel_size=pixel_size)
             tile_to_grid = self._generate_global_aoi(generate_global=True,
                                                      pixel_resolution_m=pixel_size,
@@ -1945,7 +1945,7 @@ class EarthAccessDownloader:
         mod35 = MOD35SwathProcessor(
             radius_of_influence=1500,
             fill_value=np.nan,
-            nprocs=4,
+            nprocs=1,
         )
 
         # Flatten all grid cells once — reused for every file
@@ -2869,19 +2869,49 @@ class MOD35SwathProcessor:
     @contextmanager
     def _mod03_file(self, hdf_path: str):
         """
-        Locate, download, yield, then delete the matching MOD03 granule.
+        Locate and temporarily download the matching MOD03/MYD03 geolocation granule via earthaccess.
+        The local temp file is removed automatically when the context exits.
         """
+        import earthaccess
+        import glob
+
         parts = self._parse_modis_filename(hdf_path)
-        url   = self._laads_search_mod03(parts)
-        logger.debug(f"[MOD03] Downloading: {url.split('/')[-1]}")
+
+        short_name = self._build_mod03_shortname(parts)
+        date_str = parts["date"]          # YYYYDDD
+        time_str = parts["time"]          # HHMM
+        collection = parts["collection"]  # 061
+
+        date_iso = datetime.strptime(date_str, "%Y%j").strftime("%Y-%m-%d")
+        target_stem = f"{short_name}.A{date_str}.{time_str}.{collection}."
 
         with tempfile.TemporaryDirectory(prefix="mod03_") as tmpdir:
-            local_path = self._download_file(url, tmpdir)
-            try:
-                yield local_path
-            finally:
-                if os.path.exists(local_path):
-                    os.remove(local_path)
+            earthaccess.login(strategy="environment")
+
+            results = earthaccess.search_data(
+                short_name=short_name,
+                temporal=(date_iso, date_iso),
+            )
+
+            matches = [r for r in results if target_stem in str(r)]
+            if not matches:
+                raise FileNotFoundError(f"No matching {short_name} granule found for {target_stem}")
+
+            earthaccess.download(matches[:1], tmpdir)
+
+            files = sorted(glob.glob(os.path.join(tmpdir, f"{target_stem}*.hdf")))
+            if not files:
+                raise FileNotFoundError(f"No downloaded MOD03 file found for {target_stem}")
+
+            local_path = files[0]
+
+            with open(local_path, "rb") as f:
+                magic = f.read(4)
+
+            if magic != b"\x0e\x03\x13\x01":
+                raise RuntimeError(f"Downloaded MOD03 is not a valid HDF4 file: {local_path}")
+
+            yield local_path
 
     # ------------------------------------------------------------------
     # Swath reading
