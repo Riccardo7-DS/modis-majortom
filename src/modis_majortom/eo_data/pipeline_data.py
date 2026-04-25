@@ -30,7 +30,7 @@ sys.dont_write_bytecode = True
 parser = argparse.ArgumentParser(description="MODIS Downloader")
 parser.add_argument('--product', type=str, default=os.getenv('product', 'reflectance_250m'), help='MODIS product to download')
 parser.add_argument('--reproj_lib', choices=['rioxarray', 'xesmf'], default=os.getenv('REPROJ_LIB', 'rioxarray'), help='Reprojection library to use')
-parser.add_argument('--reproj_method', choices=['nearest', 'bilinear'], default=os.getenv('REPROJ_METHOD', 'nearest'), help='Reprojection method to use')    
+parser.add_argument('--reproj_method', choices=['nearest', 'bilinear'], default=os.getenv('REPROJ_METHOD', 'nearest'), help='Reprojection method to use')
 parser.add_argument('-d', '--delete_temp', action='store_true', default=False, help='Delete temporary files after processing')
 parser.add_argument('--lon_min', type=float, default=os.getenv('lon_min', -70))
 parser.add_argument('--lat_min', type=float, default=os.getenv('lat_min', -70))
@@ -67,8 +67,8 @@ products = {
 
         "reflectance_250m": {
             "short_name": "MOD09GQ",
-            "variables": ["sur_refl_b01", 
-                           "sur_refl_b02", 
+            "variables": ["sur_refl_b01",
+                           "sur_refl_b02",
                            "QC_250m"
             ],
             "raw_data_type" : "hdf",
@@ -105,7 +105,7 @@ products = {
             ],
             "raw_data_type" : "h5"
         },
-        
+
         "VIIRS_500m_night_daily": {
             "short_name": "VNP46A2",
             "variables": ["Gap_Filled_DNB_BRDF_Corrected_NTL",
@@ -116,9 +116,17 @@ products = {
         }
     }
 
-print("AWS_ACCESS_KEY_ID:", os.getenv("AWS_ACCESS_KEY_ID"))
-print("AWS_SECRET_ACCESS_KEY:", os.getenv("AWS_SECRET_ACCESS_KEY")[:4] + "****")
-print("AWS_S3_ENDPOINT:", os.getenv("AWS_S3_ENDPOINT"))
+def mask_env(value, visible=4):
+    if not value:
+        return "<not set>"
+    if len(value) <= visible:
+        return "*" * len(value)
+    return value[:visible] + "****"
+
+if args.store_cloud:
+    print("AWS_ACCESS_KEY_ID:", mask_env(os.getenv("AWS_ACCESS_KEY_ID")))
+    print("AWS_SECRET_ACCESS_KEY:", mask_env(os.getenv("AWS_SECRET_ACCESS_KEY")))
+    print("AWS_S3_ENDPOINT:", os.getenv("AWS_S3_ENDPOINT") or "<not set>")
 
 if args.majortom_grid and args.output_format != "zarr":
     logger.error("MajorTom grid is only supported with Zarr output format.")
@@ -131,7 +139,7 @@ variables = [v.strip() for v in args.variables_override.split(",")] if args.vari
 short_name = products[args.product]["short_name"]
 raw_data_type = products[args.product]["raw_data_type"]
 resolution = products[args.product].get("resolution", None)
-patch_size = products[args.product].get("patch_size", 256) 
+patch_size = products[args.product].get("patch_size", 256)
 
 logger.info(f"Starting download for product: {args.product} ({short_name}) with variables: {variables}, patch_size: {patch_size}")
 
@@ -142,9 +150,9 @@ batch_days = args.batch_days
 bboxes = generate_bboxes_fixed(
         lon_min=args.lon_min,
         lon_max=args.lon_max,
-         lat_min=args.lat_min, 
+         lat_min=args.lat_min,
         lat_max=args.lat_max,
-        n_lon=args.n_lon, 
+        n_lon=args.n_lon,
         n_lat=args.n_lat,
 )
 
@@ -154,7 +162,7 @@ if os.path.exists(Path(DATA_PATH) / "water_min.npy"):
     logger.info("Loading precomputed filtered bounding boxes from water_min.npy")
     water_min = np.load(Path(DATA_PATH) / "water_min.npy", allow_pickle=True).tolist()
 
-else:    
+else:
     water_min = [
         tile
         for tile in tqdm(bboxes, desc="Filtering tiles")
@@ -167,9 +175,9 @@ plot_boxes_on_map(water_min)
 
 # Loop over each bounding box and download
 for i, bbox in tqdm(enumerate(water_min), desc="Processing tiles for download", total=len(water_min)):
-
+    downloader = None
     try:
-        
+
         downloader = EarthAccessDownloader(
             args=args,
             data_dir="/vsis3/mtg-fci-data/modis" if args.store_cloud else Path(DATA_PATH) / "modis",
@@ -182,7 +190,7 @@ for i, bbox in tqdm(enumerate(water_min), desc="Processing tiles for download", 
             output_format=args.output_format,
             raw_data_type=raw_data_type,
             add_new_variables=args.add_variables,
-    )   
+    )
         if args.delete_temp and downloader.temp_dir.exists():
             logger.warning("Deleting temporary directory as per user request.")
             shutil.rmtree( downloader.temp_dir)
@@ -193,5 +201,3 @@ for i, bbox in tqdm(enumerate(water_min), desc="Processing tiles for download", 
         downloader.cleanup()
         logger.error(e)
         raise e
-
-

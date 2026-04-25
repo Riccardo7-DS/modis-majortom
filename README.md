@@ -52,14 +52,20 @@ majortom = { git = "https://github.com/ESA-PhiLab/Major-TOM.git" }
 **NASA Earthdata** — required for downloading MODIS data. Set credentials as environment variables or in a `.env` file:
 
 ```
-EARTHDATA_USER=your_username
-EARTHDATA_PASS=your_password
+EARTHDATA_USERNAME=your_username
+EARTHDATA_PASSWORD=your_password
 ```
 
 **Google Earth Engine** — required for land fraction filtering. Authenticate once via:
 
 ```bash
 earthengine authenticate
+```
+
+and set project-ID as environment variables or in a `.env` file:
+
+```
+EE_PROJECT=your_gee_project_id
 ```
 
 **MinIO/S3** (optional) — required only when using `--store_cloud`:
