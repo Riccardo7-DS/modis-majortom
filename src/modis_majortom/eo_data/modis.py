@@ -6,7 +6,7 @@ from pyhdf.SD import SD, SDC
 from ..definitions import DATA_PATH
 import tempfile
 from collections import defaultdict
-import gc 
+import gc
 import rasterio
 import os
 import re
@@ -23,15 +23,15 @@ from typing import Literal
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from ..utils import prepare, minio_client, setup_minio_config, extract_object_from_minio
 from pyproj import Transformer
-import ee, geemap 
+import ee, geemap
 from datetime import datetime, timedelta
 from pystac_client import Client
 import pyproj
 from majortom import Grid
 import zarr
 import json
-import re 
-import time 
+import re
+import time
 import errno
 from contextlib import contextmanager
 from pyresample import geometry
@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 
 class EeModis():
     def __init__(self,
-                 start_date:str, 
+                 start_date:str,
                  end_date:str,
                  name:Literal["ref_250m_061","NDVI_1km_monthly_061", "LST_061"],
                  output_dir:str,
@@ -59,11 +59,11 @@ class EeModis():
                  output_resolution:int=1000,
                  crs='EPSG:4326',
                  format:Literal["GeoTIFF","COG"]="GeoTIFF"):
-        
-        
+
+
         ee.Authenticate()
         ee.Initialize(project=os.environ["EE_PROJECT"])
-        
+
         valid_names = {"ref_250m_061","LST_061", "NDVI_1km_monthly_061"}
         assert name in valid_names, \
             "Invalid value for 'name'. It should be one of: 'ref_250m_061', 'LST_061', 'NDVI_1km_monthly_061'"
@@ -82,31 +82,31 @@ class EeModis():
         self._crs = crs
 
 
-    def run(self, 
+    def run(self,
             download_collection:bool=False,
             compute_ndvi:bool=False):
-        
+
         """
         download_collection: if True, download the entire image collection,
                                 otherwise download each image separately.
         """
         import ee
-    
+
         # Import images
         images = ee.ImageCollection(self.product)\
                     .filterDate(self.start_date, self.end_date)\
                     .filterBounds(self.polygon)
-        
+
         self.bands = self._get_bands(self.product)
         img_bands = images.select(self.bands)
 
         img_bands = self._preprocess(img_bands, compute_ndvi=compute_ndvi)
-        
+
         if download_collection:
             self._collection_prepr_download(img_bands)
         else:
-            self._export_images_to_local(img_bands, 
-                self.out_dir, 
+            self._export_images_to_local(img_bands,
+                self.out_dir,
                 scale=self.output_resolution)
 
     def _preprocess(self, img_bands, compute_ndvi:bool=False):
@@ -195,9 +195,9 @@ class EeModis():
             [30.288233396779802,15.808293611760663]]]
         )
         return  ee.Geometry(polygon, None, False)
-        
+
     def _collection_prepr_download(self, images):
-        geemap.ee_export_image_collection(images, self.out_dir, self._format, crs=self._crs)        
+        geemap.ee_export_image_collection(images, self.out_dir, self._format, crs=self._crs)
 
 
     """Export each MODIS image locally as a Cloud Optimized GeoTIFF."""
@@ -229,7 +229,7 @@ class EeModis():
         xmax, ymax = coords[2][0], coords[2][1]
         dx = (xmax - xmin) / nx
         dy = (ymax - ymin) / ny
-    
+
         rois = []
         for i in range(nx):
             for j in range(ny):
@@ -237,27 +237,27 @@ class EeModis():
                 y0, y1 = ymin + j*dy, ymin + (j+1)*dy
                 rois.append(ee.Geometry.Rectangle([x0, y0, x1, y1]))
         return rois
-    
+
     def _image_prepr_download(self, images, nx=2, ny=2):
         """Export each image in the collection, automatically splitting large ROIs."""
         import ee
         import logging
         logger = logging.getLogger(__name__)
-    
+
         # Split ROI
         tiles = self._split_roi(self.polygon, nx=nx, ny=ny)
-    
+
         # Get image IDs
         image_ids = images.aggregate_array("system:index").getInfo()
-    
+
         for idx, image_id in tqdm(enumerate(image_ids), total=len(image_ids)):
             img = ee.Image(image_id)
-    
+
             for t_idx, tile in enumerate(tiles):
                 img_tile = img.clip(tile)
                 proj = img_tile.projection().getInfo()
                 filename = f"{image_id.split('/')[-1]}_tile{t_idx}"
-    
+
                 task = ee.batch.Export.image.toDrive(
                     image=img_tile,
                     description=filename,
@@ -270,7 +270,7 @@ class EeModis():
                 )
                 task.start()
                 logger.info(f"Exporting {filename}...")
-    
+
     def _preprocess_file(self, ds:xr.Dataset):
         import pandas as pd
         time = ds.encoding['source'].split("/")[-1].replace("_","/")[:-4]
@@ -283,11 +283,11 @@ class EeModis():
         import xarray as xr
         import os
         files = [os.path.join(self.out_dir,f) for f in os.listdir(self.out_dir) if f.endswith(".tif")]
-        dataset = xr.open_mfdataset(files, 
-                                    preprocess=self._preprocess_file, 
+        dataset = xr.open_mfdataset(files,
+                                    preprocess=self._preprocess_file,
                                     engine="rasterio")
         return dataset
-    
+
 
 class EarthAccessDownloader:
     """
@@ -317,29 +317,29 @@ class EarthAccessDownloader:
             self._resolution = resolution
 
         self._add_new_variables = add_new_variables
-        
+
         self.date_range = self._check_dates(date_range)
 
         self.short_name = short_name
         self.variable = variables
         self.bbox = bbox
         self.collection_name = collection_name
-        
+
         self._check_cloud_or_local(data_dir, args.store_cloud)
-        
+
         self._crs = crs
         self._reproj_lib = self._check_reproj_lib(args.reproj_lib)
         self._reproj_method = self._check_reproj_method(args.reproj_method)
-        
+
         self.raw_data_type = raw_data_type
         self._output_format = output_format
 
         self.temp_dir = Path(tempfile.mkdtemp())
-        
+
         # Initialize MinIO configuration if cloud storage is enabled
         if self._store_cloud and os.getenv('AWS_ACCESS_KEY_ID') is None:
             setup_minio_config()
-        
+
         self._login_earthaccess()
 
         if "state_1km" in (self.variable or []):
@@ -383,7 +383,7 @@ class EarthAccessDownloader:
         self.granule_dir = f"{collection_path}/raw_data" if store_cloud else collection_path / "raw_data"
 
         if not store_cloud:
-            self.granule_dir.mkdir(parents=True, exist_ok=True) 
+            self.granule_dir.mkdir(parents=True, exist_ok=True)
 
         if zarr_path and not store_cloud:
             self.zarr_path = zarr_path
@@ -391,9 +391,9 @@ class EarthAccessDownloader:
             self.zarr_path = self.data_dir / f"{self.short_name}_dataset.zarr"
         elif store_cloud and zarr_path:
             raise NotImplementedError("Zarr output not implemented for cloud storage.")
-        
+
         self._minio_client = minio_client() if store_cloud else None
-        
+
         if store_cloud:
             self.minio_bucket = os.getenv('MINIO_BUCKET')
             self.minio_prefix = os.getenv('MINIO_PREFIX', 'modis')  # default if not set
@@ -452,7 +452,7 @@ class EarthAccessDownloader:
         existing = self._load_zarr_index()
         merged = set(existing) | set(dates_set)
         self._save_zarr_index(merged)
-        
+
     def _check_disk_space(self, min_gb=1, path=None):
         """Return True if free disk space >= min_gb on the filesystem containing `path`.
         If `path` is None, use DATA_PATH.
@@ -464,20 +464,40 @@ class EarthAccessDownloader:
             return free_gb >= float(min_gb)
         except Exception:
             return True
-        
+
     def _check_reproj_lib(self, reproj_lib):
         valid_libs = ["rioxarray", "xesmf"]
         if reproj_lib not in valid_libs:
             raise ValueError(f"Invalid reproj_lib '{reproj_lib}'. Must be one of {valid_libs}.")
         logger.info(f"Using reproj_lib: {reproj_lib}")
         return reproj_lib
-    
+
     def _check_reproj_method(self, reproj_method):
         valid_methods = ["nearest", "bilinear"]
         if reproj_method not in valid_methods:
             raise ValueError(f"Invalid reproj_method '{reproj_method}'. Must be one of {valid_methods}.")
         logger.info(f"Using reproj_method: {reproj_method} with {self._crs}")
         return reproj_method
+
+    def _rio_resampling(self):
+        """
+        Convert CLI/string resampling method to rasterio Resampling enum.
+        rioxarray expects rasterio.enums.Resampling, not a plain string.
+        """
+        from rasterio.enums import Resampling
+
+        resampling_dict = {
+            "nearest": Resampling.nearest,
+            "bilinear": Resampling.bilinear,
+        }
+
+        try:
+            return resampling_dict[self._reproj_method]
+        except KeyError:
+            raise ValueError(
+                f"Invalid reproj_method '{self._reproj_method}'. "
+                f"Must be one of {list(resampling_dict.keys())}."
+            )
 
     def _get_utm_crs(self, bbox=None):
         """
@@ -527,7 +547,7 @@ class EarthAccessDownloader:
         if date_range is None or len(date_range) != 2:
             raise ValueError("date_range must be a tuple of (start_date, end_date)")
         return date_range
-    
+
 
     def _missing_date_ranges(self, start_date, end_date, processed_dates):
         """
@@ -578,10 +598,10 @@ class EarthAccessDownloader:
         """
         Search and download data for missing dates within a given date range.
         """
-    
+
         if date_range is None:
             date_range = self.date_range
-    
+
         start_date, end_date = date_range
 
         # Build list of all dates in the requested range (YYYY-MM-DD)
@@ -605,21 +625,21 @@ class EarthAccessDownloader:
         done_dates_range = [d for d in all_dates if d in processed_dates]
         if len(done_dates_range) > 0:
             logger.info(f"Skipping {len(done_dates_range)} already processed dates.")
-    
+
         missing_ranges = self._missing_date_ranges(
             start_date, end_date, processed_dates
         )
-    
+
         if not missing_ranges:
             logger.info("✅ No missing dates to download.")
             self.files = None
             return
-    
+
         for sub_range in missing_ranges:
             logger.info(
                 f"🔍 Searching for {self.short_name} data from {sub_range[0]} to {sub_range[1]}..."
             )
-    
+
             results = earthaccess.search_data(
                 short_name=self.short_name,
                 bounding_box=(
@@ -628,9 +648,9 @@ class EarthAccessDownloader:
                 ),
                 temporal=sub_range,
             )
-    
+
             logger.info(f"⬇️ Downloading {len(results)} files to {self.granule_dir}")
-    
+
             if results:
                 if self._store_cloud:
                     earthaccess.download(results, self.temp_dir)
@@ -642,12 +662,12 @@ class EarthAccessDownloader:
             all_files = sorted(glob.glob(str(self.granule_dir / f"{self.short_name}*.{self.raw_data_type}")))
         else:
             all_files = sorted(glob.glob(str(self.temp_dir / f"{self.short_name}*.{self.raw_data_type}")))
-        
+
         # Filter files to only keep those within the requested date range
         start_date, end_date = self.date_range if date_range is None else date_range
         range_start = datetime.strptime(start_date, "%Y-%m-%d")
         range_end = datetime.strptime(end_date, "%Y-%m-%d")
-        
+
         self.files = []
         for f in all_files:
             file_date = self._get_date(f)
@@ -706,7 +726,7 @@ class EarthAccessDownloader:
     def _get_hv(self, filename):
         match = re.search(r'\.h(\d+)v(\d+)\.', filename)
         return int(match.group(1)), int(match.group(2))
-    
+
     def _validate_latlon_bounds(self, lat, lon, tol=1e-6):
         """
         Validate that the lat/lon arrays define a meaningful bounding box.
@@ -827,7 +847,7 @@ class EarthAccessDownloader:
         ds_regridded.attrs["crs"] = self._crs
 
         return ds_regridded
-    
+
     def _get_processed_dates_for_variables(self, dates_to_check=None) -> set:
         """
         Like _get_processed_dates but scoped to the variables currently being downloaded.
@@ -956,7 +976,7 @@ class EarthAccessDownloader:
                         logger.info(f"No existing Zarr file found at {zarr_path}, starting fresh.")
             except Exception:
                 logger.info(f"No existing Zarr file found at {zarr_path}, starting fresh.")
-        
+
         else:
             # Original TIFF logic
             if self._store_cloud:
@@ -990,7 +1010,7 @@ class EarthAccessDownloader:
                 logger.info(f"Found {len(processed_dates)} processed dates locally: {tif_out_dir}")
 
         return processed_dates
-    
+
     def _exclude_processed_files(self, files):
         processed_dates = self._get_processed_dates()
 
@@ -1009,10 +1029,10 @@ class EarthAccessDownloader:
 
             if date_str not in processed_dates:
                 filtered_files.append(h5_file)
-        
+
         pattern = re.compile(r'\.h(\d+)v(\d+)\.')
         files_sorted = sorted(filtered_files, key=lambda x: tuple(map(int, pattern.search(x).groups())))
-        
+
         return files_sorted
 
 
@@ -1190,8 +1210,8 @@ class EarthAccessDownloader:
 
                 da_utm = da.rio.reproject(
                     dst_crs=dest_crs,
-                    resampling=self._reproj_method,
-                    resolution=self._resolution
+                    resampling=self._rio_resampling(),
+                    resolution=self._resolution,
                 )
 
                 da_utm.attrs.pop("scale_factor", None)
@@ -1248,7 +1268,7 @@ class EarthAccessDownloader:
         except Exception as e:
             logger.warning(f"GDAL mosaic failed for {var}: {e}")
             return None
-        
+
 
     def _drop_empty_coordinates(self, ds:xr.Dataset):
         # Only drop if coordinates exist
@@ -1288,7 +1308,7 @@ class EarthAccessDownloader:
 
         # Construct output path
         filename = f"{self.short_name}_{date:%Y%m%d}.tif"
-        
+
         if self._store_cloud:
             # Cloud: full /vsis3/ path as string
             out_tif = f"{self.tif_out_dir}/{filename}"
@@ -1340,7 +1360,7 @@ class EarthAccessDownloader:
             f"{extract_object_from_minio(self.granule_dir)}/tiffs/{filename}",
             str(out_tif),
         )
-                    
+
 
     def _export_single_bands(self, ds_date, date, tile_dir=None):
         """
@@ -1348,22 +1368,22 @@ class EarthAccessDownloader:
         """
         if tile_dir is None and not self._store_cloud:
             tile_dir = self.tif_out_dir
-        
+
         for var in ds_date.data_vars:
             filename = f"{self.short_name}_{var}_{date:%Y%m%d}.tif"
-            
+
             if not self._store_cloud:
                 out_tif = Path(tile_dir) / filename
                 Path(tile_dir).mkdir(parents=True, exist_ok=True)
-            
+
             da = ds_date[var]
-            
+
             # Determine appropriate predictor based on data type
             # PREDICTOR=3 (float prediction) only for float dtypes
             # PREDICTOR=2 (horizontal differencing) for integer dtypes
             is_float = np.issubdtype(da.dtype, np.floating)
             predictor = 3 if is_float else 2
-            
+
             # Optimized GeoTIFF options for single-band export
             rio_kwargs = {
                 "driver": "GTiff",
@@ -1375,22 +1395,22 @@ class EarthAccessDownloader:
                 "PREDICTOR": predictor,   # 3 for float, 2 for integer
                 "dtype": str(da.dtype)
             }
-            
+
             da.rio.to_raster(str(out_tif), **rio_kwargs)
-            
+
             storage_type = "MinIO" if self._store_cloud else "local"
-            logger.debug(f"✅ Exported {var} to {storage_type}: {out_tif}") 
+            logger.debug(f"✅ Exported {var} to {storage_type}: {out_tif}")
 
     # ------------------------
     # Helper: export dataset according to arg.output
     # ------------------------
-    def _export_data(self, ds_date:xr.Dataset | xr.DataArray, date:str): 
-        """ Export daily dataset according to self._output_format """ 
-        if self._output_format.lower() == "tiff": 
+    def _export_data(self, ds_date:xr.Dataset | xr.DataArray, date:str):
+        """ Export daily dataset according to self._output_format """
+        if self._output_format.lower() == "tiff":
             self._export_multiband_raster(ds_date, date)
-        else: 
+        else:
             raise ValueError(f"Unknown output format '{self._output_format}'")
-        
+
     def _merge_dataarrays(self, dataarrays: list[xr.DataArray]) -> xr.Dataset:
         """
         Merge a list of xarray DataArrays into a Dataset.
@@ -1399,7 +1419,7 @@ class EarthAccessDownloader:
         """
         if not dataarrays:
             return xr.Dataset()
-        
+
         # Check spatial resolutions
         resolutions = []
         for da in dataarrays:
@@ -1408,11 +1428,11 @@ class EarthAccessDownloader:
                 resolutions.append(res)
             else:
                 resolutions.append(None)
-        
+
         unique_res = set(tuple(r) if r is not None else None for r in resolutions)
         if len(unique_res) > 1:
             logger.warning(f"Different spatial resolutions detected among DataArrays: {unique_res}")
-        
+
         # For MOD09GA, resample state_1km to 500m if necessary
         if self.short_name == "MOD09GA":
             target_da = None
@@ -1424,10 +1444,13 @@ class EarthAccessDownloader:
                 for i, da in enumerate(dataarrays):
                     if da.name == "state_1km":
                         # Resample state_1km to match target_da resolution
-                        dataarrays[i] = da.rio.reproject_match(target_da, resampling=self._reproj_method)
+                        dataarrays[i] = da.rio.reproject_match(
+                            target_da,
+                            resampling=self._rio_resampling(),
+                        )
                         logger.info("Resampled state_1km to match other bands' resolution.")
                         break
-        
+
         # Merge the DataArrays
         return xr.merge(dataarrays)
 
@@ -1454,19 +1477,12 @@ class EarthAccessDownloader:
             ds_repr = ds
 
         if self._reproj_lib == "rioxarray":
-            from rasterio.enums import Resampling
-            resampling_dict = {
-                "nearest": Resampling.nearest,
-                "bilinear": Resampling.bilinear,
-            }
-
-            reproject = resampling_dict[self._reproj_method]
 
             ds_repr = ds_repr.rio.reproject(
-                dst_crs=self._crs,   
-                resampling=reproject,
+                dst_crs=self._crs,
+                resampling=self._rio_resampling(),
                 resolution=self._resolution,
-            )#.chunk({"x": 1024, "y": 1024})
+            )
 
             if (self._crs == "EPSG:6933" or self._crs.startswith("EPSG:326") or self._crs.startswith("EPSG:327")) and self.bbox is not None:
                 # Convert bbox to dataset CRS
@@ -1495,17 +1511,17 @@ class EarthAccessDownloader:
 
         elif self._reproj_lib == "xesmf":
             ds_repr = self._regridding_with_xe_modis(
-                ds_repr, 
+                ds_repr,
                 method=self._reproj_method
             )
         else:
             raise ValueError(f"Unknown reproj_lib '{self._reproj_lib}'")
-        
+
         if isinstance(ds, xr.DataArray):
             return ds_repr[ds.name]
         else:
             return ds_repr
-        
+
     # ------------------------
     # Export to Zarr
     # ------------------------
@@ -1519,9 +1535,9 @@ class EarthAccessDownloader:
             zarr_path = f"/vsis3/{self.minio_bucket}/{self.minio_prefix}/{self.collection_name}_dataset.zarr"
         else:
             zarr_path = self.zarr_path
-        
+
         logger.info(f"💾 Exporting data to {zarr_path} for bbox {self.bbox if hasattr(self, 'bbox') else 'N/A'}")
-        
+
         if self._store_cloud:
             # For cloud storage, we need to check existence differently
             try:
@@ -1593,7 +1609,7 @@ class EarthAccessDownloader:
         """Delete raw downloaded files (HDF/H5) to free disk space."""
         raw_extensions = (self.raw_data_type.lstrip("."), self.raw_data_type)
         deleted_count = 0
-        
+
         if self.granule_dir.exists():
             for f in os.listdir(self.granule_dir):
                 if f.endswith(raw_extensions):
@@ -1603,7 +1619,7 @@ class EarthAccessDownloader:
                         deleted_count += 1
                     except Exception as e:
                         logger.warning(f"Failed to delete {file_path}: {e}")
-        
+
         logger.info(f"🧹 Deleted {deleted_count} raw data files from {self.granule_dir}")
 
     def cleanup(self, clean_nontemp=False):
@@ -1618,7 +1634,7 @@ class EarthAccessDownloader:
     def _split_date_range(self, start_date, end_date, batch_days=30):
         """
         Split a date range into batches of specified days.
-        
+
         Parameters
         ----------
         start_date : str
@@ -1627,26 +1643,26 @@ class EarthAccessDownloader:
             End date in format 'YYYY-MM-DD'
         batch_days : int
             Number of days per batch
-            
+
         Returns
         -------
         list of tuples
             List of (batch_start, batch_end) date ranges
         """
         from datetime import datetime, timedelta
-        
+
         start = pd.to_datetime(start_date)
         end = pd.to_datetime(end_date)
         batches = []
-        
+
         current = start
         while current <= end:
             batch_end = min(current + timedelta(days=batch_days - 1), end)
             batches.append((current.strftime("%Y-%m-%d"), batch_end.strftime("%Y-%m-%d")))
             current = batch_end + timedelta(days=1)
-        
+
         return batches
-    
+
     def build_tile_to_grid_lookup(self, grid, cache_path):
         """
         Build mapping:
@@ -1679,13 +1695,13 @@ class EarthAccessDownloader:
 
         return tile_lookup
 
-    def _generate_global_aoi(self, 
-            pixel_resolution_m:int, 
-            patch_size_px:int, 
-            target_grid_km:bool=None, 
+    def _generate_global_aoi(self,
+            pixel_resolution_m:int,
+            patch_size_px:int,
+            target_grid_km:bool=None,
             generate_global:bool=False
         ):
-        
+
         import pickle
 
         L = patch_size_px * pixel_resolution_m  # patch size in meters
@@ -1724,19 +1740,19 @@ class EarthAccessDownloader:
             cache_path=grid_file,
         )
         return tile_to_grid
-    
-    def run(self, batch_days=30, 
-            majortom_grid: bool = False, 
-            pixel_size=250, 
-            patch_size=64, 
+
+    def run(self, batch_days=30,
+            majortom_grid: bool = False,
+            pixel_size=250,
+            patch_size=64,
             reference_band=None):
-        
+
         if majortom_grid:
             from transform import CalculationsMajorTom
             self.calculations =  CalculationsMajorTom(pixel_size=pixel_size)
-            tile_to_grid = self._generate_global_aoi(generate_global=True, 
-                                                     pixel_resolution_m=pixel_size, 
-                                                     patch_size_px=patch_size, 
+            tile_to_grid = self._generate_global_aoi(generate_global=True,
+                                                     pixel_resolution_m=pixel_size,
+                                                     patch_size_px=patch_size,
                                                      target_grid_km=100)
             if reference_band is None:
                 reference_band = self.variable if isinstance(self.variable, str) else self.variable[0]
@@ -1845,10 +1861,10 @@ class EarthAccessDownloader:
 
         raw_name = description.split(":")[-1].lower()
         band_name = re.sub(r"_\d+$", "", raw_name)
-        
+
         if band_name in REFL_BANDS:
             data = data.astype(np.float16)
-            nodata = band.GetNoDataValue() 
+            nodata = band.GetNoDataValue()
             if nodata is not None:
                 data[data == nodata] = np.nan
             scale = band.GetScale() or 1.0
@@ -1975,7 +1991,7 @@ class EarthAccessDownloader:
                 # 3. Build small target grid for this swath only
                 # --------------------------------------------------
                 target_def = mod35.build_regular_latlon_grid(
-                    bbox=[lon_min, lon_max, lat_min, lat_max], 
+                    bbox=[lon_min, lon_max, lat_min, lat_max],
                     res_deg=self.grid_res)
 
 
@@ -2445,7 +2461,7 @@ class MODISQCMask:
 
         else:
             raise ValueError(f"Unknown algorithm: {algorithm}")
-    
+
     # -----------------------------
     # 1. Cloud mask from bits 0–1
     # -----------------------------
@@ -2469,7 +2485,7 @@ class MODISQCMask:
     # -----------------------------
     # 2. Internal cloud mask (bit 10)
     # -----------------------------
-    
+
     @staticmethod
     def cloud_mask_internal(QA: xr.DataArray) -> xr.DataArray:
         """
@@ -2624,17 +2640,17 @@ def apply_modis_qa_mask(
 This function has not been tested yet
 """
 class StacModisTileProcessor:
-    def __init__(self, 
-                 stac_url, 
-                 collection, 
-                 time_range, 
-                 bands, 
-                 crs="EPSG:6933", 
-                 resolution=1000, 
-                 tile_size=256, 
-                 stride=256, 
+    def __init__(self,
+                 stac_url,
+                 collection,
+                 time_range,
+                 bands,
+                 crs="EPSG:6933",
+                 resolution=1000,
+                 tile_size=256,
+                 stride=256,
                  max_missing=0.5):
-        
+
         self.stac_url = stac_url
         self.collection = collection
         self.time_range = time_range
@@ -2654,7 +2670,7 @@ class StacModisTileProcessor:
         items = list(search.get_items())
         if not items:
             raise ValueError("No items found for the given search parameters.")
-        
+
         self.ds = load(
             items,
             bands=self.bands,
@@ -2668,12 +2684,12 @@ class StacModisTileProcessor:
     def process_tiles(self):
         if self.ds is None:
             raise RuntimeError("Data not loaded. Call load_data() first.")
-        
+
         x_coords = self.ds.x.values
         y_coords = self.ds.y.values
         x_tiles = range(0, len(x_coords) - self.tile_size + 1, self.stride)
         y_tiles = range(0, len(y_coords) - self.tile_size + 1, self.stride)
-        
+
         tile_id = 0
         for ix in x_tiles:
             for iy in y_tiles:
@@ -2681,14 +2697,14 @@ class StacModisTileProcessor:
                     x=slice(ix, ix + self.tile_size),
                     y=slice(iy, iy + self.tile_size),
                 )
-                
+
                 # Skip tiles with too much missing data
                 if tile[self.bands[0]].isnull().mean() > self.max_missing:
                     continue
-                
+
                 # Convert to numpy (time, bands, y, x)
                 tile_np = np.stack([tile[band].values for band in self.bands], axis=1)
-                
+
                 np.save(self.out_dir / f"tile_{tile_id:06d}.npy", tile_np)
                 tile_id += 1
         logger.info(f"Processed {tile_id} tiles.")
@@ -2950,7 +2966,7 @@ class MOD35SwathProcessor:
             swath_def = geometry.SwathDefinition(lons=lon, lats=lat)
 
             return swath_def, data
-        
+
         else:
             return  geometry.SwathDefinition(lons=lon, lats=lat)
 
