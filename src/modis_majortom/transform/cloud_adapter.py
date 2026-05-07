@@ -1,4 +1,5 @@
 import logging
+import os
 import random
 from matplotlib import dates
 import numpy as np
@@ -408,7 +409,7 @@ class CloudAdapterModel(nn.Module):
 
         if torch.isnan(feats_dict["x_norm_patchtokens"]).any():
             logger.warning("NaNs after backbone!")
-            return torch.zeros(B, H, W, device=x.device)
+            feats_dict["x_norm_patchtokens"] = torch.nan_to_num(feats_dict["x_norm_patchtokens"], nan=0.0)
 
         feats = feats_dict["x_norm_patchtokens"]                  # (B, h*w, feat_dim)
         feats = feats.permute(0, 2, 1).reshape(B, -1, h, w)       # (B, feat_dim, h, w)
@@ -595,14 +596,13 @@ class MODISZarrPatchDataset(Dataset):
             if self.use_meta_mask:
                 channels.append(meta_channel)
             x = np.stack(channels, axis=0)  # (C, H, W)
+            x = np.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)
 
             x_t = torch.from_numpy(x)
             y_t = torch.from_numpy(mask_250)
 
             if self.augment:
-                x, y = self._augment(x, y)
-
-            return x, y
+                x_t, y_t = self._augment(x_t, y_t)
 
             if self.use_meta_mask:
                 return x_t, y_t, torch.from_numpy(soft_score)
@@ -706,6 +706,7 @@ class CloudAdapterPipeline:
             "grid_ids": grid_ids,
         }
 
+
     # ── model ─────────────────────────────────
 
     def _load_fm(self, in_channels=3):
@@ -778,7 +779,6 @@ class CloudAdapterPipeline:
 
         if torch.isnan(x).any():
             logger.warning("NaNs in input!")
-            return
 
         x, y = resize_to_multiple_of_patch(x, y, patch_size=14)
         x = torch.nan_to_num(x, nan=-1.0)
@@ -791,14 +791,39 @@ class CloudAdapterPipeline:
             # use_meta_mask=True: dataset returns (x, y, soft_score)
         x, y, soft_score = batch
         x, y = x.to(self.device), y.to(self.device)
+
+        if torch.isnan(x).any():
+            logger.warning("NaNs in input!")
+
         soft_score = soft_score.to(self.device)
         x, y = resize_to_multiple_of_patch(x, y, patch_size=14)
+        x = torch.nan_to_num(x, nan=-1.0)
         soft_score = soft_score[:, :y.shape[-2], :y.shape[-1]]
         weight = soft_score
         self.optimizer.zero_grad()
         logits = self.model(x)                        # (B, H, W)
         loss = self.criterion(logits, y, weight)
         return loss
+
+    def _val_normal_iteration(self, batch):
+        x, y = batch[0], batch[1]
+        x, y = x.to(self.device), y.to(self.device)
+        x, y = resize_to_multiple_of_patch(x, y, patch_size=14)
+        x = torch.nan_to_num(x, nan=-1.0)
+        logits = self.model(x)
+        loss = self.criterion(logits, y, np.nan, pos_weight=self.pos_weight)
+        return logits, x, y, loss
+
+    def _val_soft_score_iteration(self, batch):
+        x, y, soft_score = batch
+        x, y = x.to(self.device), y.to(self.device)
+        soft_score = soft_score.to(self.device)
+        x, y = resize_to_multiple_of_patch(x, y, patch_size=14)
+        x = torch.nan_to_num(x, nan=-1.0)
+        soft_score = soft_score[:, :y.shape[-2], :y.shape[-1]]
+        logits = self.model(x)
+        loss = self.criterion(logits, y, soft_score, pos_weight=self.pos_weight)
+        return logits, x, y, loss
 
     def train(self, epochs=10, checkpoint_every=1):
         logger.info("Starting training...")
@@ -830,10 +855,8 @@ class CloudAdapterPipeline:
             for batch in tqdm(self.train_loader, desc=f"Epoch {epoch} [Train]"):
                 if batch is None:
                     continue
-
-                if args.use_meta_mask:
+                if self.use_meta_mask:
                     loss = self._soft_score_iteration(batch)
-
                 else:
                     loss = self._normal_iteration(batch)
                 loss.backward()
@@ -857,13 +880,10 @@ class CloudAdapterPipeline:
                     if batch is None:
                         continue
 
-                    x, y = batch
-                    x, y = x.to(self.device), y.to(self.device)
-                    x, y = resize_to_multiple_of_patch(x, y, patch_size=14)
-                    x = torch.nan_to_num(x, nan=-1.0) 
-
-                    logits = self.model(x)
-                    loss = self.criterion(logits, y, np.nan, pos_weight=self.pos_weight)
+                    if self.use_meta_mask:
+                        logits, x, y, loss = self._val_soft_score_iteration(batch)
+                    else:
+                        logits, x, y, loss = self._val_normal_iteration(batch)
 
                     val_loss += loss.item()
                     val_batches += 1
@@ -924,7 +944,7 @@ class CloudAdapterPipeline:
             # ── Plot sample predictions ──
             if n_batches > 0 and (epoch + 1) % max(1, checkpoint_every) == 0:
                 random_idx = np.random.randint(0, len(x))
-                x_sample = normalize_modis(x[random_idx], reverse=True)  # (3, H, W)
+                x_sample = x[random_idx]  # (C, H, W) — plot_sample reads x[2] for NDVI
                 y_sample = y[random_idx]  # (H, W)
                 y_pred_sample = torch.sigmoid(logits[random_idx])  # (H, W)
 
@@ -1044,34 +1064,38 @@ class CloudAdapterPipeline:
 
     def plot_sample(self, x, y_true, y_pred, save_path):
         """
-        x: (3, H, W)
+        x: (C, H, W) — channel 2 is always NDVI
         y_true: (H, W)
         y_pred: (H, W)
         """
-        ndvi = x[-1].cpu().numpy()
+        ndvi = x[2].cpu().numpy()                      # NDVI is always channel 2
+        ndvi = np.clip(ndvi, -1.0, 1.0)               # clamp before display
         y_true = y_true.cpu().numpy()
         y_pred = y_pred.detach().cpu().numpy()
 
-        fig, axs = plt.subplots(1, 3, figsize=(12, 4))
+        fig, axs = plt.subplots(1, 3, figsize=(14, 4))
 
-        # Show input NDVI and add colorbar
-        im0 = axs[0].imshow(ndvi, cmap="Greens")
-        axs[0].set_title("Input NDVI")
-        fig.colorbar(im0, ax=axs[0], fraction=0.046, pad=0.04)  # fraction and pad control size/spacing
+        # NDVI — clamp to [-1, 1], show actual range in title
+        im0 = axs[0].imshow(ndvi, cmap="RdYlGn", vmin=-1.0, vmax=1.0)
+        axs[0].set_title(f"Input NDVI  [min={ndvi.min():.2f}, max={ndvi.max():.2f}]")
+        fig.colorbar(im0, ax=axs[0], fraction=0.046, pad=0.04)
 
         # Ground truth
-        axs[1].imshow(y_true, cmap="gray")
-        axs[1].set_title("Ground Truth")
+        im1 = axs[1].imshow(y_true, cmap="gray", vmin=0.0, vmax=1.0)
+        axs[1].set_title(f"Ground Truth  [min={y_true.min():.2f}, max={y_true.max():.2f}]")
+        fig.colorbar(im1, ax=axs[1], fraction=0.046, pad=0.04)
 
-        # Prediction
-        axs[2].imshow(y_pred, cmap="viridis")
-        axs[2].set_title("Prediction")
+        # Prediction probability
+        im2 = axs[2].imshow(y_pred, cmap="viridis", vmin=0.0, vmax=1.0)
+        axs[2].set_title(f"Prediction  [min={y_pred.min():.2f}, max={y_pred.max():.2f}]")
+        fig.colorbar(im2, ax=axs[2], fraction=0.046, pad=0.04)
 
         for ax in axs:
             ax.axis("off")
 
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.tight_layout()
-        plt.savefig(save_path)
+        plt.savefig(save_path, dpi=120)
         plt.close()
 
     # ── main entry point ──────────────────────
@@ -1120,16 +1144,41 @@ class CloudAdapterPipeline:
         cube_250 = extract_modis_cube(path_mod09gq, "mod09_250", samples=200 if sample else None)
         cube_500 = extract_modis_cube(path_mod09ga, "mod09_500", samples=200 if sample else None)
 
+        cube_mod35 = None
+        if use_meta_mask and path_mod35 is not None:
+            logger.info("Extracting MOD35 cube...")
+            cube_mod35 = self.extract_mod35_cube(path_mod35, band=mod35_band, samples=200 if sample else None)
+
         logger.info("Building dataset...")
 
-        split_idx = int(0.8 * len(cube_250["dates"]))
-        train_dates = cube_250["dates"][:split_idx]
-        val_dates = cube_250["dates"][split_idx:]
+        all_dates = cube_250["dates"]
+        if start_date is not None or end_date is not None:
+            all_dates = [
+                d for d in all_dates
+                if (start_date is None or d >= start_date)
+                and (end_date is None or d <= end_date)
+            ]
+            if not all_dates:
+                raise ValueError(
+                    f"No dates remain after filtering ({start_date} – {end_date}). "
+                    f"Available range: {cube_250['dates'][0]} – {cube_250['dates'][-1]}"
+                )
+            logger.info(f"Date range filtered to {len(all_dates)} dates ({all_dates[0]} – {all_dates[-1]})")
+
+        split_idx = int(0.8 * len(all_dates))
+        train_dates = all_dates[:split_idx]
+        val_dates = all_dates[split_idx:]
 
         logger.info("Creating training dataset")
-        train_dataset = MODISZarrPatchDataset(cube_250, cube_500, min_clear_fraction=0.05, dates=train_dates, augment=True)
+        train_dataset = MODISZarrPatchDataset(
+            cube_250, cube_500, min_clear_fraction=0.05, dates=train_dates, augment=True,
+            use_blue=use_blue, use_meta_mask=use_meta_mask, cube_mod35=cube_mod35,
+        )
         logger.info("Creating validation dataset")
-        val_dataset = MODISZarrPatchDataset(cube_250, cube_500, min_clear_fraction=0.05, dates=val_dates)
+        val_dataset = MODISZarrPatchDataset(
+            cube_250, cube_500, min_clear_fraction=0.05, dates=val_dates,
+            use_blue=use_blue, use_meta_mask=use_meta_mask, cube_mod35=cube_mod35,
+        )
 
         persistent_workers = True if num_workers > 0 else False
 
@@ -1205,6 +1254,7 @@ if __name__ == "__main__":
 
     path_modis_500 = DATA_PATH / "modis/data/modis" / "MOD09GA_dataset.zarr"
     path_modis_250 = DATA_PATH / "modis/data/modis" / "MOD09GQ_dataset.zarr"
+    path_mod35 = DATA_PATH / "modis/data/modis" / "MOD35_L2_dataset.zarr"
 
     cloud_pipe = CloudAdapterPipeline(
         model_name=("facebookresearch/dinov2", "dinov2_vits14"))
@@ -1219,7 +1269,7 @@ if __name__ == "__main__":
         num_workers=args.num_workers,        
         use_blue=args.use_blue,
         use_meta_mask=args.use_meta_mask,
-        path_mod35=args.path_mod35,
+        path_mod35=path_mod35,
         start_date=args.start_date,
         end_date=args.end_date,
     )
