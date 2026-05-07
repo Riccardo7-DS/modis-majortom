@@ -27,8 +27,6 @@ dependencies = [
     "cartopy>=0.25.0",
     "minio>=7.2.20",
     "joblib>=1.5.3",
-    "torch>=2.9.1",
-    "torchvision",
     "timm>=1.0.22",
     "scipy",
     "matplotlib>=3.10.6",
@@ -36,10 +34,14 @@ dependencies = [
     "pyproj",
     "majortom",
     "dask",
+    "gdal==3.11.4",
+    "modape",
 ]
 
 [tool.uv.sources]
 majortom = { git = "https://github.com/ESA-PhiLab/Major-TOM.git" }
+modape = { git = "https://github.com/WFP-VAM/modape.git" }
+
 
 [build-system]
 requires = ["hatchling"]
