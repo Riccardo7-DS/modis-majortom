@@ -34,7 +34,7 @@ dependencies = [
     "pyproj",
     "majortom",
     "dask",
-    "gdal==3.11.4",
+    "gdal==3.12.2",
     "modape",
 ]
 

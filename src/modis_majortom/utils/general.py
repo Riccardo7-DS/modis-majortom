@@ -21,6 +21,8 @@ logger = logging.getLogger(__name__)
 
 
 def minio_client():
+    from dotenv import load_dotenv
+    load_dotenv()
     endpoint = os.getenv("AWS_S3_ENDPOINT")
     if endpoint is None:
         raise ValueError("AWS_S3_ENDPOINT is not set")
@@ -346,6 +348,38 @@ def download_collection_tiffs(client,
     
     return summary
 
+MTG_BUCKET = "mtg-fci-data"
+MTG_DATA_PATH = DATA_PATH / "mtg_data"
+
+
+def download_from_mtg_fci(object_path: str, dest_path: Path | None = None) -> Path:
+    """
+    Download an object from the 'mtg-fci-data' MinIO bucket to DATA_PATH/mtg_data,
+    preserving the object's path structure.
+
+    Args:
+        object_path: Full key inside the bucket (e.g. "2024/01/01/file.nc").
+        dest_path: Optional path for the downloaded file.
+
+    Returns:
+        Path to the downloaded local file.
+    """
+    client = minio_client()
+    if dest_path is not None:
+        local_file = dest_path
+    else:
+        local_file = MTG_DATA_PATH 
+    local_file.parent.mkdir(parents=True, exist_ok=True)
+
+    client.fget_object(
+        bucket_name=MTG_BUCKET,
+        object_name=object_path,
+        file_path=str(local_file),
+    )
+    logger.info(f"Downloaded {MTG_BUCKET}/{object_path} → {local_file}")
+    return local_file
+
+
 def prepare(dataset:Union[xr.DataArray, xr.Dataset]):
     if "valid_time" in dataset.dims:
         dataset = dataset.rename({"valid_time":"time"})
@@ -475,3 +509,5 @@ def init_logging(log_file=None, verbose=False):
 
     logger = logging.getLogger()
     return logger
+
+    
