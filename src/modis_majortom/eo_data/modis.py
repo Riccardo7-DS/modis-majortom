@@ -399,11 +399,23 @@ class EarthAccessDownloader:
             self.minio_prefix = os.getenv('MINIO_PREFIX', 'modis')  # default if not set
 
     def _zarr_index_path(self):
-        """Return Path to a small JSON index storing processed dates (local only)."""
+        """Return Path to a small JSON index storing processed dates (local only).
+
+        When a bbox is set the filename includes the bbox coordinates so that
+        multiple tiles writing into the same zarr store each maintain an
+        independent skip-list — preventing a tile from being skipped just
+        because another tile already wrote the same date.
+        """
         if self._store_cloud:
             return None
         try:
-            return self.zarr_path.with_name(f"{self.zarr_path.name}.index.json")
+            bbox = getattr(self, "bbox", None)
+            if bbox:
+                bbox_str = "_".join(format(x, ".1f") for x in bbox)
+                name = f"{self.zarr_path.name}.{bbox_str}.index.json"
+            else:
+                name = f"{self.zarr_path.name}.index.json"
+            return self.zarr_path.with_name(name)
         except Exception:
             return None
 
@@ -915,25 +927,38 @@ class EarthAccessDownloader:
                 zarr_path = f"/vsis3/{self.minio_bucket}/{self.minio_prefix}/{self.collection_name}_dataset.zarr"
 
             try:
-                # Use index if up-to-date
+                # When a bbox is set (tiled run), each tile owns its own per-bbox index
+                # file and must NOT probe the shared zarr store — doing so would find
+                # dates written by other tiles and falsely skip this tile's download.
+                bbox_is_set = bool(getattr(self, "bbox", None))
+
                 index_path = self._zarr_index_path()
-                if index_path and index_path.exists() and not self._store_cloud:
-                    try:
-                        z_arr_path = Path(zarr_path)
-                        z_mtime = z_arr_path.stat().st_mtime if z_arr_path.exists() else 0
-                        if index_path.stat().st_mtime >= z_mtime:
-                            cached = self._load_zarr_index()
-                            if dates_to_check:
-                                processed_dates.update(d for d in dates_to_check if d in cached)
-                                if set(dates_to_check).issubset(cached):
-                                    logger.debug("Using up-to-date zarr index for processed dates")
+                if index_path and not self._store_cloud:
+                    if index_path.exists():
+                        try:
+                            z_arr_path = Path(zarr_path)
+                            z_mtime = z_arr_path.stat().st_mtime if z_arr_path.exists() else 0
+                            if index_path.stat().st_mtime >= z_mtime or bbox_is_set:
+                                cached = self._load_zarr_index()
+                                if dates_to_check:
+                                    processed_dates.update(d for d in dates_to_check if d in cached)
+                                    if set(dates_to_check).issubset(cached):
+                                        logger.debug("Using up-to-date zarr index for processed dates")
+                                        return processed_dates
+                                else:
+                                    processed_dates.update(cached)
+                                    logger.info(f"Loaded {len(processed_dates)} processed dates from index: {index_path}")
                                     return processed_dates
-                            else:
-                                processed_dates.update(cached)
-                                logger.info(f"Loaded {len(processed_dates)} processed dates from index: {index_path}")
-                                return processed_dates
-                    except Exception:
-                        logger.debug("Failed to use zarr index, will probe store")
+                        except Exception:
+                            logger.debug("Failed to use zarr index, will probe store")
+                    elif bbox_is_set:
+                        # Per-bbox index doesn't exist yet → this tile has never run → nothing processed.
+                        logger.debug(f"No per-bbox index found at {index_path}, treating all dates as unprocessed.")
+                        return set()
+
+                if bbox_is_set:
+                    # Should not reach here, but guard against probing shared store for tiled runs.
+                    return processed_dates
 
                 # Open Zarr using consolidated metadata if available
                 store = None

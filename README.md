@@ -13,7 +13,8 @@ A Python package for downloading, processing, and archiving MODIS satellite data
 - Export to chunked Zarr stores or cloud-optimized GeoTIFFs
 - Optional cloud storage via MinIO/S3
 - Google Earth Engine integration for land fraction filtering and auxiliary products
-- Incremental processing: skips already-processed dates automatically
+- Incremental processing: skips already-processed dates per tile, safe to resume interrupted runs
+- Global tiled downloads: divide the globe into n×m tiles and append all patches into one shared Zarr
 
 ## Supported Products
 
@@ -56,6 +57,14 @@ EARTHDATA_USERNAME=your_username
 EARTHDATA_PASSWORD=your_password
 ```
 
+Alternatively, a bearer token can be used (generate one at [urs.earthdata.nasa.gov](https://urs.earthdata.nasa.gov) → My Profile → Generate Token):
+
+```
+EARTHDATA_TOKEN=eyJ...
+```
+
+Note: tokens expire after ~60 days. Username + password authentication handles renewal automatically and is preferred for long-running pipelines.
+
 **Google Earth Engine** — required for land fraction filtering. Authenticate once via:
 
 ```bash
@@ -94,6 +103,23 @@ python -m modis_majortom.eo_data.pipeline_data \
   --reproj_method bilinear
 ```
 
+**Global download to a single MajorTOM Zarr:**
+
+```bash
+python -m modis_majortom.eo_data.pipeline_data \
+  --product reflectance_250m \
+  --start_date 2025-06-01 \
+  --end_date 2025-06-02 \
+  --lon_min -180 --lon_max 180 \
+  --lat_min -80  --lat_max 80 \
+  --n_lon 12 --n_lat 8 \
+  --batch_days 2 \
+  --majortom_grid \
+  -d
+```
+
+This splits the globe into 96 tiles (8×12), filters out ocean-only tiles via GEE (≥30% land), and streams all patches from every land tile into a single shared `data/modis/MOD09GQ_dataset.zarr`. Each tile tracks its own processed-date index (`*.index.json`) so the run is safe to interrupt and resume.
+
 #### Key Arguments
 
 | Argument | Default | Description |
@@ -112,6 +138,7 @@ python -m modis_majortom.eo_data.pipeline_data \
 | `--store_cloud` | `False` | Upload output to MinIO/S3 |
 | `--add_variables` | `False` | Add variables to existing Zarr without re-downloading |
 | `--variables_override` | — | Comma-separated list of specific bands |
+| `-d` / `--delete_temp` | `False` | Delete raw HDF files after each tile to save disk |
 
 ### Python API
 
@@ -146,23 +173,26 @@ print(result.soft_score)     # float32 (H, W) — clearness confidence
 
 ```
 pipeline_data.py (CLI)
-       │
-       ▼
-EarthAccessDownloader (modis.py)
-  ├── Search & Download (earthaccess)
-  │     └── Skip already-processed dates via Zarr index
-  ├── Parse & Mosaic (GDAL)
-  │     ├── Open HDF subdatasets via GDAL
-  │     ├── Reproject tiles to target CRS
-  │     └── Merge via VRT + GDAL Translate
-  ├── Product Preprocessing
-  │     └── DN → physical units (LST, NDVI, night lights)
-  ├── Cloud Masking (optional)
-  │     └── generate_cloud_mask() (cloud_adapter.py)
-  └── Export
-        ├── Zarr (chunked, time-indexed)
-        └── GeoTIFF (rasterio)
-              └── Optional MinIO/S3 upload
+  ├── generate_bboxes_fixed()  — divide AOI into n×m tiles
+  ├── tile_has_min_land_fraction() (GEE)  — drop ocean tiles
+  │     └── result cached in data/water_min.npy
+  └── for each tile → EarthAccessDownloader (modis.py)
+        ├── _get_processed_dates()
+        │     └── reads per-tile <zarr>.<bbox>.index.json
+        │           → returns empty set if index absent (tile never run)
+        │           → does NOT probe shared Zarr store (avoids false skips)
+        ├── Search & Download (earthaccess)
+        ├── Parse & Mosaic (GDAL)
+        │     ├── Open HDF subdatasets
+        │     ├── Reproject to target CRS (EPSG:6933)
+        │     └── Merge via VRT + GDAL Translate
+        ├── Product Preprocessing
+        │     └── DN → physical units (LST, NDVI, night lights)
+        ├── Cloud Masking (optional)
+        │     └── generate_cloud_mask() (cloud_adapter.py)
+        ├── Export to shared Zarr (MajorTOM sparse format)
+        │     └── patches/<variable>/<date>/<grid_id>/data
+        └── _update_zarr_index()  — persist processed dates to per-tile index
 ```
 
 ## Cloud Masking
@@ -189,16 +219,22 @@ An optional `CloudAdapterModel` (DINOv2 ViT-S/14 backbone + lightweight adapter 
 **Zarr (default)**:
 ```
 data/modis/
+├── MOD09GQ_dataset.zarr/
+│   └── patches/
+│       ├── sur_refl_b01/
+│       │   └── <date>/
+│       │       └── <grid_id>/   ← MajorTOM cell, e.g. "23D_51L"
+│       │           └── data     ← array (256, 256) float32
+│       └── sur_refl_b02/
+│           └── ...
+├── MOD09GQ_dataset.zarr.<lon_min>_<lat_min>_<lon_max>_<lat_max>.index.json
+│   ← per-tile skip-list: tracks which dates each tile has already written
 └── MOD09GQ_061/
     └── <bbox>/
-        ├── MOD09GQ_dataset.zarr/
-        │   ├── patches/
-        │   │   ├── sur_refl_b01/
-        │   │   │   └── <date>/<grid_id>/...
-        │   │   └── sur_refl_b02/
-        │   └── .zmetadata
-        └── MOD09GQ_dataset.zarr.index.json
+        └── raw_data/            ← temporary HDF files (deleted with -d)
 ```
+
+Each tile writes its patches directly into the shared `MOD09GQ_dataset.zarr` under the corresponding `<date>/<grid_id>` groups. Tiles do not overlap in grid space, so concurrent appends are safe.
 
 **GeoTIFF**:
 ```
@@ -212,10 +248,18 @@ data/modis/
 ## Utilities
 
 - `generate_bboxes_fixed()` — divide a region into n×m equal tiles
-- `tile_has_min_land_fraction()` — filter tiles by land coverage (GEE-based)
+- `tile_has_min_land_fraction()` — filter tiles by land coverage (GEE-based); results cached in `data/water_min.npy` — delete this file when changing the AOI or tile grid
 - `CalculationsMajorTom` — lat/lon ↔ MODIS sinusoidal ↔ tile (h,v) ↔ pixel conversions
 - `compute_ndvi()` — NDVI from red and NIR arrays
 - `minio_client()` — initialise MinIO S3 client from environment
+
+## Known Behaviours and Gotchas
+
+**`water_min.npy` is bbox-specific.** The land-fraction filter caches its results to `data/water_min.npy`. If you change `--lon_min/max`, `--lat_min/max`, `--n_lat`, or `--n_lon`, delete this file first so it is recomputed for the new grid.
+
+**Per-tile processed-date indexes.** Each tile writes its skip-list to `<zarr>.<lon_min>_<lat_min>_<lon_max>_<lat_max>.index.json` alongside the Zarr. These files are what make resume-after-crash safe: a tile whose index is absent is treated as entirely unprocessed, regardless of what other tiles have written into the shared Zarr. Do not delete them mid-run.
+
+**Shared Zarr, isolated skip-lists.** All tiles append patches into the same `MOD09GQ_dataset.zarr`. The per-tile index isolation prevents a date written by tile A from being mistakenly counted as "done" for tile B — a bug that would cause most tiles to silently skip all downloads.
 
 ## License
 

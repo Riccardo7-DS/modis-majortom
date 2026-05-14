@@ -168,7 +168,7 @@ else:
         for tile in tqdm(bboxes, desc="Filtering tiles")
         if tile_has_min_land_fraction(tile, scale=250, min_percentage=30)
     ]
-    np.save("water_min.npy", np.array(water_min))
+    np.save(Path(DATA_PATH) / "water_min.npy", np.array(water_min))
 
 logger.info(f"Selected {len(water_min)} tiles out of {len(bboxes)} total tiles")
 plot_boxes_on_map(water_min)

@@ -368,7 +368,7 @@ def download_from_mtg_fci(object_path: str, dest_path: Path | None = None) -> Pa
     if dest_path is not None:
         local_file = dest_path
     else:
-        local_file = MTG_DATA_PATH 
+        local_file = MTG_DATA_PATH / object_path
     local_file.parent.mkdir(parents=True, exist_ok=True)
 
     client.fget_object(
@@ -378,6 +378,62 @@ def download_from_mtg_fci(object_path: str, dest_path: Path | None = None) -> Pa
     )
     logger.info(f"Downloaded {MTG_BUCKET}/{object_path} → {local_file}")
     return local_file
+
+
+def list_mtg_fci_objects(prefix: str = "", recursive: bool = False) -> list[str]:
+    """
+    List object keys in the 'mtg-fci-data' MinIO bucket.
+
+    Args:
+        prefix: Filter results to keys starting with this prefix.
+        recursive: If True, list all nested keys; otherwise list only the
+                   top-level "directories" (common prefixes) under prefix.
+
+    Returns:
+        Sorted list of object names (or common-prefix strings when not recursive).
+    """
+    client = minio_client()
+    objects = client.list_objects(MTG_BUCKET, prefix=prefix, recursive=recursive)
+    return sorted(obj.object_name for obj in objects)
+
+
+def upload_zarr_to_huggingface(
+    local_zarr_path: Path | str,
+    repo_id: str,
+    repo_type: str = "dataset",
+    token: str | None = None,
+    num_workers: int = 4,
+) -> None:
+    """
+    Upload a local Zarr store directory to a HuggingFace repository using
+    upload_large_folder, which handles chunking, retries, and parallel uploads.
+    The folder contents are uploaded to the repo root.
+
+    Args:
+        local_zarr_path: Path to the local Zarr directory to upload.
+        repo_id: HuggingFace repo in the form 'username/repo-name'.
+        repo_type: 'dataset', 'model', or 'space' (default: 'dataset').
+        token: HuggingFace token; falls back to HF_TOKEN env var or cached login.
+        num_workers: Number of parallel upload threads (default: 4).
+    """
+    from huggingface_hub import HfApi
+    from dotenv import load_dotenv
+    load_dotenv()
+
+    local_zarr_path = Path(local_zarr_path)
+    if not local_zarr_path.exists():
+        raise FileNotFoundError(f"Zarr path not found: {local_zarr_path}")
+
+    api = HfApi(token=token or os.getenv("HF_TOKEN"))
+    api.create_repo(repo_id=repo_id, repo_type=repo_type, exist_ok=True)
+
+    api.upload_large_folder(
+        folder_path=str(local_zarr_path),
+        repo_id=repo_id,
+        repo_type=repo_type,
+        num_workers=num_workers,
+    )
+    logger.info(f"Uploaded {local_zarr_path} → https://huggingface.co/{repo_type}s/{repo_id}")
 
 
 def prepare(dataset:Union[xr.DataArray, xr.Dataset]):
