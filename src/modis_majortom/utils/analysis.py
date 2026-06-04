@@ -51,19 +51,66 @@ def decode_state1km(
     return mask.astype(bool)
 
 
-def compute_ndvi(band1: xr.DataArray,
-                 band2: xr.DataArray) -> xr.DataArray:
+def mask_invalid_reflectance(
+    band: "np.ndarray | xr.DataArray",
+    fill_below: float = -0.05,
+) -> "np.ndarray | xr.DataArray":
+    """Set physically invalid reflectance pixels to NaN.
+
+    Parameters
+    ----------
+    band :
+        Reflectance array (numpy or xarray).  Modified in-place for numpy
+        inputs; returns a new DataArray for xarray inputs.
+    fill_below :
+        Pixels with value strictly below this threshold are set to NaN.
+        The default (−0.05) catches MODIS fill values while keeping slightly
+        negative valid retrievals caused by atmospheric over-correction.
+
+    Returns
+    -------
+    Same type as input, with fill pixels replaced by NaN.
     """
-    Compute NDVI given two reflectance bands:
-    band1 = RED
-    band2 = NIR
+    if isinstance(band, xr.DataArray):
+        return band.where(band >= fill_below)
+    arr = np.asarray(band, dtype=np.float32)
+    arr[arr < fill_below] = np.nan
+    return arr
+
+
+def compute_ndvi(
+    band1: "np.ndarray | xr.DataArray",
+    band2: "np.ndarray | xr.DataArray",
+    fill_below: float | None = None,
+) -> "np.ndarray | xr.DataArray":
+    """Compute NDVI from two reflectance bands.
+
+    Parameters
+    ----------
+    band1 :
+        Red band (numpy or xarray).
+    band2 :
+        NIR band (numpy or xarray).
+    fill_below :
+        If given, apply :func:`mask_invalid_reflectance` with this threshold
+        before computing the ratio.  Prevents fill-value blow-up in the
+        denominator.  Pass ``-0.05`` to use the MODIS default.
+
+    Returns
+    -------
+    float32 array of the same type as the inputs.
     """
+    if fill_below is not None:
+        band1 = mask_invalid_reflectance(band1, fill_below)
+        band2 = mask_invalid_reflectance(band2, fill_below)
+
     denom = band2 + band1
     num   = band2 - band1
 
-    # Mask zero denominators BEFORE division → no warnings
-    safe_denom = xr.where(denom == 0, np.nan, denom)
+    if isinstance(denom, xr.DataArray):
+        safe_denom = denom.where(denom != 0)
+    else:
+        safe_denom = np.where(denom == 0, np.nan, denom)
 
     ndvi = num / safe_denom
-
-    return ndvi.astype("float32")
+    return np.asarray(ndvi, dtype=np.float32) if not isinstance(ndvi, xr.DataArray) else ndvi.astype("float32")

@@ -39,6 +39,78 @@ from .cloud_adapter import upsample_500_to_250
 log = logging.getLogger(__name__)
 
 
+# ── Module-level helper for multiprocessing (must be picklable) ────────────────
+
+def _detect_pixel(
+    ndvi_ts, doy, mod_weights, landcover_class,
+    n_iter, min_clear_obs, max_pos_residual, min_abs_residual, floor_residual,
+    lc_k, lc_k_default, min_clear_obs_default, max_pos_residual_default,
+    min_abs_residual_default, floor_residual_default,
+    llas, half_normal_corr,
+):
+    """Standalone per-pixel cloud detection callable for process-pool workers.
+
+    Mirrors ``WhittakerPipeline.detect_clouds`` but captures all configuration
+    as plain arguments so it can be pickled by joblib's process backend.
+    """
+    from modape.whittaker import ws2d, ws2doptv
+
+    if min_clear_obs    is None: min_clear_obs    = min_clear_obs_default
+    if max_pos_residual is None: max_pos_residual = max_pos_residual_default
+    if min_abs_residual is None: min_abs_residual = min_abs_residual_default
+    if floor_residual   is None: floor_residual   = floor_residual_default
+
+    T = len(ndvi_ts)
+    month = np.clip((doy - 1) // 30, 0, 11).astype(np.int32) + 1
+
+    w = mod_weights.astype(np.float64).copy()
+    w[np.isnan(ndvi_ts)] = 0.0
+    y = np.where(np.isnan(ndvi_ts), 0.0, ndvi_ts).astype(np.float64)
+
+    if w.sum() == 0:
+        return (
+            np.zeros(T, dtype=bool),
+            np.ones(T, dtype=bool),
+            np.full(T, np.nan, dtype=np.float32),
+            np.full(T, np.nan, dtype=np.float32),
+        )
+
+    z, lmda = ws2doptv(y, w, llas)
+    z = np.array(z, dtype=np.float64)
+    for _ in range(n_iter):
+        residual_iter = y - z
+        w_new = w.copy()
+        w_new[residual_iter < 0] *= 0.1
+        z = np.array(ws2d(y, lmda, w_new), dtype=np.float64)
+        w = w_new
+    ndvi_smooth = z.astype(np.float32)
+
+    residuals = ndvi_ts.astype(np.float32) - ndvi_smooth
+    sigma_by_month: dict[int, float] = {}
+    for m in range(1, 13):
+        mask_m = month == m
+        pos_res = residuals[mask_m & ~np.isnan(residuals) & (residuals > 0)]
+        pos_res = pos_res[pos_res <= max_pos_residual]
+        sigma_by_month[m] = float(pos_res.std()) * half_normal_corr if pos_res.size > 1 else 1e-3
+
+    k = lc_k.get(landcover_class, lc_k_default)
+    threshold = np.array([-k * sigma_by_month[m] for m in month], dtype=np.float32)
+    valid       = ~np.isnan(residuals)
+    stat_cloud  = valid & (residuals < threshold) & (np.abs(residuals) >= min_abs_residual)
+    floor_cloud = valid & (residuals < -floor_residual)
+    cloud_mask  = stat_cloud | floor_cloud
+
+    uncertain_mask = np.zeros(T, dtype=bool)
+    confident_clear = mod_weights > 0.5
+    for m in range(1, 13):
+        mask_m = month == m
+        if int(confident_clear[mask_m].sum()) < min_clear_obs:
+            uncertain_mask[mask_m] = True
+    cloud_mask[uncertain_mask] = False
+
+    return cloud_mask, uncertain_mask, ndvi_smooth, residuals
+
+
 # ── Result type ────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -193,8 +265,9 @@ class WhittakerPipeline:
         "ndvi_raw", "ndvi_smoothed", "ndvi_envelope",
         "cloud_mask_algo", "uncertain_mask", "residuals",
         "cloud_mask_mod35", "cloud_mask_state1km",
+        "soft_score",
     })
-    DEFAULT_VARIABLES: tuple = ("ndvi_smoothed", "cloud_mask_algo", "uncertain_mask")
+    DEFAULT_VARIABLES: tuple = ("ndvi_envelope", "soft_score")
 
     # Default log₁₀(λ) search grid for ws2doptv / ws2doptvp.
     # Both functions expect log10-transformed lambda values (not actual lambdas).
@@ -243,7 +316,10 @@ class WhittakerPipeline:
             b02 = patches_250["sur_refl_b02"][date][grid_id][:].astype(np.float32)
         except (KeyError, Exception):
             return None
-        return compute_ndvi(b02, b01).astype(np.float32)
+        # fill_below=-0.05 masks MODIS fill values before the NIR/Red ratio;
+        # clip guards residual outliers from near-zero (but non-zero) denominators.
+        ndvi = compute_ndvi(b02, b01, fill_below=-0.05)
+        return np.clip(ndvi, -1.0, 1.0)
 
     @staticmethod
     def _load_cloud_mask(
@@ -473,6 +549,7 @@ class WhittakerPipeline:
         min_abs_residual: float | None = None,
         floor_residual: float | None = None,
         n_jobs: int = 1,
+        variables: list[str] | None = None,
     ):
         """Load and Whittaker-smooth a multi-date NDVI stack for one grid cell.
 
@@ -526,10 +603,17 @@ class WhittakerPipeline:
             dims=("time", "y", "x"),
             coords={"time": t_idx, "y": np.arange(H), "x": np.arange(W)},
         )
-        # Pass llas through; smooth_xarray falls back to _LLAS default if None.
-        smoothed = self.smooth_xarray(ndvi_da_tmp, p=p, llas=llas).values   # (T, H, W)
+        # Only run the symmetric Whittaker smooth when explicitly requested.
+        # The detection step already produces ndvi_envelope (asymmetric smooth),
+        # which is a better gap-fill for ML targets and costs no extra compute.
+        _vars = set(variables) if variables is not None else set(self.DEFAULT_VARIABLES)
+        if "ndvi_smoothed" in _vars:
+            smoothed = self.smooth_xarray(ndvi_da_tmp, p=p, llas=llas).values
+        else:
+            smoothed = None
 
-        log.info("Smoothed NDVI stack: shape=%s, dates=%s", smoothed.shape, valid_dates)
+        log.info("NDVI stack: shape=%s, dates=%s  (smooth_skipped=%s)",
+                 ndvi_masked.shape, valid_dates, smoothed is None)
 
         if not as_dataset:
             return smoothed, valid_dates
@@ -629,14 +713,36 @@ class WhittakerPipeline:
                     mod35_layers.append(m35.astype(np.float32))
             mod35_mask = np.stack(mod35_layers, axis=0)
 
+        # ── Soft score: continuous cloud confidence for ML loss weighting ────
+        # 1.0 = confident clear, 0.5 = uncertain (too few clear obs in month),
+        # 0.0 = cloud (flagged by primary mask or Whittaker residual detector).
+        # Missing primary mask pixels (NaN) are treated as uncertain (0.5).
+        algo_cloud     = detection["cloud_mask"].values      # bool (T, H, W)
+        algo_uncertain = detection["uncertain_mask"].values  # bool (T, H, W)
+        if self.weight_source == "state1km":
+            primary_cloud = state1km_stack > 0.5   # NaN > 0.5 → False in numpy
+            primary_nan   = np.isnan(state1km_stack)
+        else:
+            primary_cloud = mod35_mask > 0.5
+            primary_nan   = np.isnan(mod35_mask)
+        is_cloud     = primary_cloud | algo_cloud
+        is_uncertain = algo_uncertain | primary_nan
+        soft_score   = np.where(is_cloud, 0.0,
+                       np.where(is_uncertain, 0.5, 1.0)).astype(np.float32)
+
         # ── Assemble dataset ─────────────────────────────────────────────────
         def _da(arr, long_name=""):
             return xr.DataArray(arr, dims=dims, coords=coords,
                                 attrs={"long_name": long_name} if long_name else {})
 
-        return xr.Dataset({
-            "ndvi_raw":            _da(ndvi_raw,      "Raw NDVI (no cloud masking)"),
-            "ndvi_smoothed":       _da(ndvi_smoothed, "Whittaker-smoothed NDVI (ws2doptv, V-curve λ)"),
+        dataset_vars = {
+            "ndvi_raw":  _da(ndvi_raw, "Raw NDVI (no cloud masking)"),
+        }
+        if ndvi_smoothed is not None:
+            dataset_vars["ndvi_smoothed"] = _da(
+                ndvi_smoothed, "Whittaker-smoothed NDVI (ws2doptv, V-curve λ)"
+            )
+        dataset_vars.update({
             "ndvi_envelope":       detection["ndvi_smooth"].assign_attrs(
                                        {"long_name": "Asymmetric Whittaker upper envelope (ws2d, fixed λ)"}),
             "cloud_mask_algo":     detection["cloud_mask"].assign_attrs(
@@ -648,7 +754,10 @@ class WhittakerPipeline:
             "cloud_mask_mod35":    _da(mod35_mask,    "MOD35 cloud mask (True=cloud, from weights)"),
             "cloud_mask_state1km": _da(state1km_stack,
                                        f"state_1km cloud mask [{self.state1km_algorithm}] (True=cloud; NaN=not available)"),
+            "soft_score":          _da(soft_score,
+                                       "Cloud soft score (1=confident clear, 0.5=uncertain, 0=cloud)"),
         })
+        return xr.Dataset(dataset_vars)
 
     def detect_clouds(
         self,
@@ -869,22 +978,20 @@ class WhittakerPipeline:
         else:
             lc_flat = np.asarray(landcover_class).reshape(N)
 
-        def _process(i: int):
-            res = self.detect_clouds(
-                ndvi_flat[:, i],
-                doy,
-                mod_flat[:, i],
-                landcover_class=int(lc_flat[i]) if lc_flat[i] != -1 else None,
-                n_iter=n_iter,
-                min_clear_obs=min_clear_obs,
-                max_pos_residual=max_pos_residual,
-                min_abs_residual=min_abs_residual,
-                floor_residual=floor_residual,
+        # prefer="processes": ws2doptv/ws2d hold the GIL so threads serialize;
+        # separate processes each have their own GIL → true parallelism.
+        results = Parallel(n_jobs=n_jobs, prefer="processes")(
+            delayed(_detect_pixel)(
+                ndvi_flat[:, i], doy, mod_flat[:, i],
+                int(lc_flat[i]) if lc_flat[i] != -1 else None,
+                n_iter, min_clear_obs,
+                max_pos_residual, min_abs_residual, floor_residual,
+                self.LC_K, self.LC_K_DEFAULT,
+                self.MIN_CLEAR_OBS, self.MAX_POS_RESIDUAL,
+                self.MIN_ABS_RESIDUAL, self.FLOOR_RESIDUAL,
+                self._LLAS, self._HALF_NORMAL_CORR,
             )
-            return res.cloud_mask, res.uncertain_mask, res.ndvi_smooth, res.residuals
-
-        results = Parallel(n_jobs=n_jobs, prefer="threads")(
-            delayed(_process)(i) for i in range(N)
+            for i in range(N)
         )
 
         # Unpack and reshape back to (T, H, W)
@@ -1051,7 +1158,7 @@ class WhittakerPipeline:
         except ImportError:
             def _tqdm(it, **_kw):   # type: ignore[misc]
                 return it
-        from numcodecs import Blosc
+        from zarr.codecs import BloscCodec
 
         output_zarr = Path(output_zarr)
         variables = list(variables) if variables is not None else list(self.DEFAULT_VARIABLES)
@@ -1078,7 +1185,7 @@ class WhittakerPipeline:
 
         # ── open output store and pre-create all variable/date groups ─────
         # Pre-creation avoids TOCTOU races when the grid loop runs in parallel.
-        compressor = Blosc(cname="zstd", clevel=5, shuffle=Blosc.BITSHUFFLE)
+        compressor = BloscCodec(cname="zstd", clevel=5, shuffle="bitshuffle")
         out_store   = zarr.open(str(output_zarr), mode="a")
         out_patches = out_store.require_group("patches")
         for var in variables:
@@ -1096,6 +1203,7 @@ class WhittakerPipeline:
                     all_dates,
                     as_dataset=True,
                     n_jobs=pixel_jobs,
+                    variables=variables,
                     **detect_kwargs,
                 )
             except Exception as exc:
@@ -1115,12 +1223,12 @@ class WhittakerPipeline:
                     if grid_id in dg:
                         dg[grid_id][:] = patch
                     else:
-                        dg.create(
+                        dg.create_array(
                             name=grid_id,
                             shape=patch.shape,
                             chunks=patch.shape,
                             dtype=patch.dtype,
-                            compressor=compressor,
+                            compressors=[compressor],
                         )
                         dg[grid_id][:] = patch
 

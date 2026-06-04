@@ -37,11 +37,13 @@ dependencies = [
     "gdal==3.12.2",
     "modape",
     "huggingface-hub>=0.23.0",
+    "eumetsearch[transform]",
 ]
 
 [tool.uv.sources]
 majortom = { git = "https://github.com/ESA-PhiLab/Major-TOM.git" }
 modape = { git = "https://github.com/WFP-VAM/modape.git" }
+eumetsearch = { path = "../eumetsearch", editable = true }
 
 
 [build-system]

@@ -1,10 +1,20 @@
 import numpy as np
 
 class CalculationsMajorTom():
-    def __init__(self, pixel_size = 250):
-        self.PIXEL_SIZE = pixel_size # meters
-        self.TILE_SIZE = 1111950  # meters
-        self.R = 6371007.181  # Earth radius for MODIS sinusoidal
+    TILE_SIZE = 1111950  # metres per MODIS sinusoidal tile
+    R = 6371007.181      # Earth radius used by MODIS sinusoidal projection
+
+    # MODIS actual pixels-per-tile for each nominal resolution label.
+    # Actual pixel size = TILE_SIZE / pixels_per_tile  (NOT the nominal label).
+    # e.g. "250 m" product → 4800 px/tile → 231.65625 m/px (not 250 m).
+    _PIXELS_PER_TILE = {250: 4800, 500: 2400, 1000: 1200}
+
+    def __init__(self, pixel_size=250):
+        n = self._PIXELS_PER_TILE.get(int(pixel_size))
+        if n is not None:
+            self.PIXEL_SIZE = self.TILE_SIZE / n   # actual pixel size in metres
+        else:
+            self.PIXEL_SIZE = float(pixel_size)
 
     def latlon_to_sinu(self, lat, lon):
         lat = np.deg2rad(lat)

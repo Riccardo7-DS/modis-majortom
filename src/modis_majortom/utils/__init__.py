@@ -1,4 +1,4 @@
-from .analysis import compute_ndvi, decode_mod35, decode_state1km
+from .analysis import compute_ndvi, mask_invalid_reflectance, decode_mod35, decode_state1km
 from .general import (
     minio_client,
     extract_object_from_minio,

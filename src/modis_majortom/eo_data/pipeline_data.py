@@ -7,6 +7,7 @@ from dotenv import load_dotenv
 import argparse
 import os
 import shutil
+import traceback
 from ..utils import init_logging
 import sys
 from tqdm import tqdm
@@ -198,6 +199,8 @@ for i, bbox in tqdm(enumerate(water_min), desc="Processing tiles for download", 
         downloader.run(batch_days=batch_days, majortom_grid = args.majortom_grid, patch_size=patch_size, pixel_size=resolution)
 
     except Exception as e:
-        downloader.cleanup()
+        if downloader is not None:
+            downloader.cleanup()
         logger.error(e)
-        raise e
+        logger.error(traceback.format_exc())
+        continue

@@ -1,3 +1,10 @@
+from .dataset import (
+    AncillarySource,
+    MODISSource,
+    ERA5Source,
+    AlignedPatchDataset,
+    build_sample_index,
+)
 from .cloud_adapter import (
     CloudMaskResult,
     generate_cloud_mask,
