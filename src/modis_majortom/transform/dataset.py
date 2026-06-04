@@ -187,11 +187,11 @@ class MODISSource(AncillarySource):
         return {k: _sample_array(v, frac_row, frac_col) for k, v in bands.items()}
 
     def available_dates(self) -> set[str]:
-        return set(self._processed_store["patches"]["ndvi_smoothed"].keys())
+        return set(self._processed_store["patches"]["ndvi_envelope"].keys())
 
     def available_grid_ids(self, date: str) -> set[str]:
         try:
-            return set(self._processed_store["patches"]["ndvi_smoothed"][date].keys())
+            return set(self._processed_store["patches"]["ndvi_envelope"][date].keys())
         except KeyError:
             return set()
 
