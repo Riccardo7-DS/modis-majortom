@@ -53,6 +53,7 @@ from eumetsearch.transform.fci_modis_align import (
 )
 from eumetsearch.transform.ndvi import _build_fci_index
 from ..utils import compute_ndvi
+from .cloud_adapter import upsample_500_to_250
 
 _LOG = logging.getLogger(__name__)
 
@@ -125,12 +126,14 @@ class MODISSource(AncillarySource):
     """Wraps raw and processed MODIS zarr stores as an ancillary source.
 
     ``raw_zarr_path`` must contain ``patches/sur_refl_b01`` and
-    ``patches/sur_refl_b02`` (MOD09GQ bands).  ``ndvi_observed`` is computed
-    on-the-fly from these so it never needs to be pre-stored.
+    ``patches/sur_refl_b02`` (MOD09GQ 250 m bands).  ``ndvi_observed`` is
+    computed on-the-fly from these so it never needs to be pre-stored.
 
     ``processed_zarr_path`` must contain the Whittaker pipeline outputs:
-    ``patches/ndvi_smoothed`` and ``patches/soft_score`` (written by
-    ``WhittakerPipeline.process_zarr``).
+    ``patches/ndvi_envelope`` and ``patches/soft_score`` (written by
+    ``WhittakerPipeline.process_zarr`` with ``product="MOD09GA"``).
+    Patches are 256×256 (500 m) and are upsampled 2× to 512×512 inside
+    :meth:`load` to match the GQ coordinate frame used by :meth:`reproject`.
 
     Both stores are opened once per thread and cached in thread-local storage.
     """
@@ -162,13 +165,15 @@ class MODISSource(AncillarySource):
         raw  = self._raw_store["patches"]
         proc = self._processed_store["patches"]
 
-        # ndvi_observed: computed on-the-fly — no need to pre-store a derived quantity
+        # ndvi_observed: on-the-fly from GQ (512×512, 250 m)
         b01      = raw["sur_refl_b01"][date][grid_id][:].astype(np.float32)
         b02      = raw["sur_refl_b02"][date][grid_id][:].astype(np.float32)
         ndvi_obs = np.asarray(compute_ndvi(b02, b01, fill_below=-0.05), dtype=np.float32)
 
-        ndvi_whi = proc["ndvi_envelope"][date][grid_id][:].astype(np.float32)
-        soft     = proc["soft_score"][date][grid_id][:].astype(np.float32)
+        # ndvi_envelope + soft_score from GA-processed zarr (256×256, 500 m).
+        # Upsample 2× so all bands share the 512×512 GQ coordinate frame expected by reproject().
+        ndvi_whi = upsample_500_to_250(proc["ndvi_envelope"][date][grid_id][:].astype(np.float32))
+        soft     = upsample_500_to_250(proc["soft_score"][date][grid_id][:].astype(np.float32))
         return {"ndvi_observed": ndvi_obs, "ndvi_whittaker": ndvi_whi, "soft_score": soft}
 
     def patch_origin(self, lat: float, lon: float) -> tuple[int, int]:

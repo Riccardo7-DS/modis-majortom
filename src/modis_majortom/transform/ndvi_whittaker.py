@@ -298,11 +298,20 @@ class WhittakerPipeline:
             self.LC_K = k           # per-class lookup table
         elif k is not None:
             self.LC_K_DEFAULT = float(k)   # single value overrides the default
+        self._store_cache: dict[str, zarr.Group] = {}
+
     # ── Private zarr helpers ──────────────────────────────────────────────────
 
-    @staticmethod
-    def _open(path: Path) -> zarr.Group:
-        return zarr.open(path, mode="r")
+    def _open(self, path: Path) -> zarr.Group:
+        """Open a zarr store, caching the result so repeated opens are free.
+
+        zarr.open on a local store with many groups can take several seconds
+        (metadata scan); caching avoids paying that cost once per date/grid.
+        """
+        key = str(path)
+        if key not in self._store_cache:
+            self._store_cache[key] = zarr.open(path, mode="r")
+        return self._store_cache[key]
 
     @staticmethod
     def _load_ndvi_patch(
@@ -394,8 +403,8 @@ class WhittakerPipeline:
                       Source determined by ``self.weight_source``.
         valid_dates : list[str]   dates with at least one valid NDVI patch
         """
-        store_250   = self._open(self.path_250)
-        patches_250 = store_250["patches"]
+        ndvi_path   = self.path_250 if self.product == "MOD09GQ" else self.path_500
+        patches_250 = self._open(ndvi_path)["patches"]
 
         # Open the MOD35 store only when needed.
         patches_cloud: zarr.Group | None = None
@@ -410,7 +419,7 @@ class WhittakerPipeline:
         for date in dates:
             ndvi = self._load_ndvi_patch(patches_250, date, grid_id)
             if ndvi is None:
-                log.debug("No 250 m data for %s / %s — skipping", grid_id, date)
+                log.debug("No NDVI data for %s / %s — skipping", grid_id, date)
                 continue
 
             raw_layers.append(ndvi.copy())
@@ -625,6 +634,7 @@ class WhittakerPipeline:
             ndvi_smoothed=smoothed,
             weights=weights,
             valid_dates=valid_dates,
+            requested_vars=_vars,
             landcover_class=landcover_class,
             max_pos_residual=max_pos_residual,
             min_abs_residual=min_abs_residual,
@@ -640,6 +650,7 @@ class WhittakerPipeline:
         ndvi_smoothed: np.ndarray,
         weights: np.ndarray,
         valid_dates: list[str],
+        requested_vars: set[str] | None = None,
         landcover_class: int | None = None,
         max_pos_residual: float | None = None,
         min_abs_residual: float | None = None,
@@ -697,12 +708,11 @@ class WhittakerPipeline:
                 s1km_layers.append(mask.astype(np.float32))
         state1km_stack = np.stack(s1km_layers, axis=0)
 
-        # ── MOD35 binary mask — always loaded from the MOD35 store ───────────
-        # When weight_source="state1km" the smoothing weights aren't from MOD35,
-        # so we load MOD35 independently here to keep the dataset variable correct.
+        # ── MOD35 binary mask — only loaded when explicitly requested ────────
+        need_mod35 = requested_vars is None or "cloud_mask_mod35" in requested_vars
         if self.weight_source == "mod35":
             mod35_mask = (1.0 - weights).astype(np.float32)   # fast path: reuse weights
-        else:
+        elif need_mod35:
             patches_cloud = self._open(self.path_cloud)["patches"]
             mod35_layers: list[np.ndarray] = []
             for date in valid_dates:
@@ -710,8 +720,10 @@ class WhittakerPipeline:
                 if m35 is None:
                     mod35_layers.append(np.full((H, W), np.nan, dtype=np.float32))
                 else:
-                    mod35_layers.append(m35.astype(np.float32))
+                    mod35_layers.append(m35[:H, :W].astype(np.float32))
             mod35_mask = np.stack(mod35_layers, axis=0)
+        else:
+            mod35_mask = np.full((len(valid_dates), H, W), np.nan, dtype=np.float32)
 
         # ── Soft score: continuous cloud confidence for ML loss weighting ────
         # 1.0 = confident clear, 0.5 = uncertain (too few clear obs in month),
@@ -1186,7 +1198,7 @@ class WhittakerPipeline:
         # ── open output store and pre-create all variable/date groups ─────
         # Pre-creation avoids TOCTOU races when the grid loop runs in parallel.
         compressor = BloscCodec(cname="zstd", clevel=5, shuffle="bitshuffle")
-        out_store   = zarr.open(str(output_zarr), mode="a")
+        out_store   = zarr.open(str(output_zarr), mode="a", use_consolidated=False)
         out_patches = out_store.require_group("patches")
         for var in variables:
             vg = out_patches.require_group(var)
