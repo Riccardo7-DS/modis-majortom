@@ -309,6 +309,7 @@ class EarthAccessDownloader:
         output_format:Literal["tiff","zarr"]="zarr",
         raw_data_type=".hdf",
         add_new_variables: bool = False,
+        hdf_backend: Literal["gdal", "pyhdf"] = "pyhdf",
     ):
 
         if resolution is None:
@@ -317,6 +318,7 @@ class EarthAccessDownloader:
             self._resolution = resolution
 
         self._add_new_variables = add_new_variables
+        self._hdf_backend = hdf_backend
 
         self.date_range = self._check_dates(date_range)
 
@@ -886,9 +888,9 @@ class EarthAccessDownloader:
                     if var in patches_grp:
                         var_grp = patches_grp[var]
                         if dates_to_check:
-                            per_var.append({d for d in dates_to_check if d in var_grp})
+                            per_var.append({d for d in dates_to_check if d in var_grp and len(var_grp[d]) > 0})
                         else:
-                            per_var.append(set(var_grp.group_keys()))
+                            per_var.append({d for d in var_grp.group_keys() if len(var_grp[d]) > 0})
                     else:
                         per_var.append(set())   # variable not yet in store → nothing processed
 
@@ -978,10 +980,12 @@ class EarthAccessDownloader:
                         var_grp = patches_grp[first_var]
                         if dates_to_check:
                             for d in dates_to_check:
-                                if d in var_grp:
+                                if d in var_grp and len(var_grp[d]) > 0:
                                     processed_dates.add(d)
                         else:
-                            processed_dates.update(list(var_grp.group_keys()))
+                            processed_dates.update(
+                                d for d in var_grp.group_keys() if len(var_grp[d]) > 0
+                            )
                     # Save index for faster future lookups
                     if not self._store_cloud and processed_dates:
                         self._update_zarr_index(processed_dates)
@@ -2203,42 +2207,91 @@ class EarthAccessDownloader:
                     continue
 
                 # --- open HDF and read available subdatasets ---
-                hdf = gdal.Open(str(file_path))
-                if hdf is None:
-                    continue
-
-                subdatasets = dict(hdf.GetSubDatasets())
-
-                # --- load each requested band once into memory ---
                 band_data = {}
                 band_types = {}
                 ny = nx = None
 
-                for var in variables:
-                    var_path = next(
-                        (p for p, d in subdatasets.items() if var in d),
-                        None,
-                    )
-                    if var_path is None:
-                        band_data[var] = None
+                if self._hdf_backend == "gdal":
+                    hdf = gdal.Open(str(file_path))
+                    if hdf is None:
                         continue
 
-                    ds = gdal.Open(var_path)
-                    if ds is None:
-                        band_data[var] = None
+                    subdatasets = dict(hdf.GetSubDatasets())
+
+                    for var in variables:
+                        var_path = next(
+                            (p for p, d in subdatasets.items() if var in d),
+                            None,
+                        )
+                        if var_path is None:
+                            band_data[var] = None
+                            continue
+
+                        ds = gdal.Open(var_path)
+                        if ds is None:
+                            band_data[var] = None
+                            continue
+
+                        desc = ds.GetDescription()
+                        data = ds.ReadAsArray()
+                        band = ds.GetRasterBand(1)
+
+                        data, band_name = self._gdal_band_preprocess(data, band, desc)
+
+                        ny, nx = data.shape
+                        band_data[var] = data
+                        band_types[var] = band_name
+                        ds = None
+
+                else:  # pyhdf
+                    try:
+                        hdf_sd = SD(str(file_path), SDC.READ)
+                    except Exception as e:
+                        logger.warning(f"Cannot open HDF4 file {file_path}: {e}")
                         continue
 
-                    # Read array and metadata, then apply product-specific transforms
-                    desc = ds.GetDescription()
-                    data = ds.ReadAsArray()
-                    band = ds.GetRasterBand(1)
+                    sds_names = list(hdf_sd.datasets().keys())
 
-                    data, band_name = self._gdal_band_preprocess(data, band, desc)
+                    for var in variables:
+                        sds_name = next(
+                            (name for name in sds_names if var.lower() in name.lower()),
+                            None,
+                        )
+                        if sds_name is None:
+                            band_data[var] = None
+                            continue
 
-                    ny, nx = data.shape
-                    band_data[var] = data
-                    band_types[var] = band_name
-                    ds = None
+                        try:
+                            sds = hdf_sd.select(sds_name)
+                            data = sds.get()
+                            attrs = sds.attributes()
+                            sds.endaccess()
+                        except Exception:
+                            band_data[var] = None
+                            continue
+
+                        raw_name = sds_name.lower()
+                        band_name = re.sub(r"_\d+$", "", raw_name)
+
+                        if band_name in REFL_BANDS:
+                            data = data.astype(np.float16)
+                            fill_value = attrs.get('_FillValue')
+                            if fill_value is not None:
+                                data[data == fill_value] = np.nan
+                            scale = float(attrs.get('scale_factor') or 1.0)
+                            offset = float(attrs.get('add_offset') or 0.0)
+                            data = data * scale + offset
+                        elif band_name in QC_BANDS:
+                            data = data.astype(np.uint16)
+                            data = MODISQCMask.get_mask(data, band_name)
+                        elif band_name in CLOUD_BANDS:
+                            data = data.astype(np.uint16)
+
+                        ny, nx = data.shape
+                        band_data[var] = data
+                        band_types[var] = band_name
+
+                    hdf_sd.end()
 
                 # Safety: ensure reference band is reflectance (used to gate writes)
                 if band_types.get(reference_band) not in REFL_BANDS:
@@ -2246,18 +2299,8 @@ class EarthAccessDownloader:
                         f"Reference band {reference_band} is not reflectance: {band_types.get(reference_band)}"
                     )
 
-                # Ensure date groups exist for each variable in the Zarr `patches` group.
-                # Use require_group but catch if group already exists (safe on append).
-                for var in variables:
-                    var_grp = patches_grp.require_group(var)
-                    try:
-                        var_grp.require_group(date_str)
-                    except Exception as e:
-                        # If date group already exists, we can safely open it for writing new grid_ids
-                        logger.debug(f"Date group {date_str} already exists for {var}, will append: {e}")
-
-                # Mark this date as being written to (we may later filter by successful writes)
-                written_dates.add(date_str)
+                # Date groups are created lazily when the first patch is written,
+                # so no empty groups are left behind when no patches pass the null-fraction gate.
 
                 # --- iterate candidate MajorTOM grid cells that fall within this MODIS tile ---
                 for grid_id, lat, lon in cells:
@@ -2309,7 +2352,8 @@ class EarthAccessDownloader:
 
                         patch = np.ascontiguousarray(patch, dtype=np.float16)
 
-                        date_grp = patches_grp[var][date_str]
+                        var_grp = patches_grp.require_group(var)
+                        date_grp = var_grp.require_group(date_str)
                         gid = str(grid_id)
 
                         band_name = band_types[var]
@@ -2346,6 +2390,7 @@ class EarthAccessDownloader:
                                     arr[:] = patch
                                 success = True
                                 written_counts[date_str] += 1
+                                written_dates.add(date_str)
                                 break
                             except OSError as e:
                                 # Only handle ENOSPC here; other errors should surface
