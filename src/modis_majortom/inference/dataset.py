@@ -23,8 +23,9 @@ from eumetsearch.transform.fci_modis_align import (
 )
 from eumetsearch.transform.ndvi import _build_fci_index
 
-from ..transform.dataset import ERA5Source
+from ..transform.dataset import ERA5Source, MOD13A3Source
 from ..transform.land_cover import LandCoverSource
+from ..utils.mtg_reliability import compute_mtg_composites
 from ..utils.solar import compute_cos_sza
 
 
@@ -32,7 +33,9 @@ class InferencePatchDataset(Dataset):
     """Like AlignedPatchDataset but does not require MODIS.
 
     Returns a dict with keys:
-        ``X``           (6, 3, H, W) float32 — MTG FCI conditioning tensor
+        ``X``           (18, H, W) float32 — MTG FCI conditioning tensor
+                        (channels 0-14: 5 timestamps x [vis06,vis08,cos_sza];
+                        channels 15-17: [NDVI75, NDVI_std, CloudScore])
         ``era5``        (N_vars, n_days, H, W) float32 — ERA5 features
         ``land_cover``  (1, H, W) float32 — LC_Type1 if lc_source provided, else absent
         ``grid_id``     str
@@ -48,12 +51,14 @@ class InferencePatchDataset(Dataset):
         samples: list[tuple[str, str]],
         target_n_pixels: int = 256,
         lc_source: LandCoverSource | None = None,
+        mod13a3_source: MOD13A3Source | None = None,
     ) -> None:
         self._fci_store_path = str(fci_store_path)
         self.era5_source = era5_source
         self.samples = list(samples)
         self.target_n_pixels = target_n_pixels
         self.lc_source = lc_source
+        self.mod13a3_source = mod13a3_source
         self._local = threading.local()
 
     def __len__(self) -> int:
@@ -107,6 +112,12 @@ class InferencePatchDataset(Dataset):
             lc_stack = np.stack([lc_aligned[v] for v in self.lc_source.variables], axis=0)
             sample["land_cover"] = torch.from_numpy(lc_stack.astype(np.float32))
 
+        if self.mod13a3_source is not None:
+            monthly = self.mod13a3_source.load(grid_id, date)
+            sample["ndvi_monthly"] = torch.from_numpy(
+                monthly["ndvi_monthly"][np.newaxis].astype(np.float32)
+            )
+
         return sample
 
     def _build_mtg_conditioning(
@@ -115,7 +126,7 @@ class InferencePatchDataset(Dataset):
         ts_rows: dict,
         target_grid: TargetGrid,
     ) -> torch.Tensor:
-        """Build the (6, 3, H, W) MTG conditioning tensor for one cell/date."""
+        """Build the (18, H, W) MTG conditioning tensor for one cell/date."""
         H = W = target_grid.n_px
         timestamps = sorted(ts_rows.keys())
         lat_deg, lon_deg = _aeqd_to_latlon(target_grid)
@@ -156,12 +167,16 @@ class InferencePatchDataset(Dataset):
             obs_frames.append(zero)
             ndvi_frames.append(np.zeros((H, W), dtype=np.float32))
 
-        mtg_stack = np.stack(obs_frames, axis=0)  # (5, 3, H, W)
-        ndvi_max = np.percentile(np.stack(ndvi_frames), 75, axis=0, keepdims=True)  # (1, H, W)
-        ndvi_frame = np.broadcast_to(ndvi_max[:, np.newaxis], (1, 3, H, W))
+        mtg_stack   = np.stack(obs_frames, axis=0)   # (5, 3, H, W)
+        ndvi_stack  = np.stack(ndvi_frames, axis=0)  # (5, H, W)
+        vis08_stack = mtg_stack[:, 1]                # (5, H, W)
+
+        raw_channels = mtg_stack.reshape(5 * 3, H, W)              # (15, H, W)
+        composites   = compute_mtg_composites(ndvi_stack, vis08_stack)  # (3, H, W)
+
         return torch.from_numpy(
-            np.concatenate([mtg_stack, np.ascontiguousarray(ndvi_frame)], axis=0)
-        )  # (6, 3, H, W)
+            np.ascontiguousarray(np.concatenate([raw_channels, composites], axis=0))
+        )  # (18, H, W)
 
 
 def build_inference_index(

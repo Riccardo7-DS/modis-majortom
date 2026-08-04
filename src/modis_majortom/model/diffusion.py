@@ -15,9 +15,13 @@ import pytorch_lightning as pl
 import yaml
 
 from .vae    import NdviVAE
-from .vae_v2 import NdviVAEv2
-from .conditioning import ERA5TokenEncoder, MTGFCIEncoder, LandCoverEmbedder
+from .vae_v2 import NdviVAEv2, NdviVAEv3
+from .conditioning import (
+    ERA5TokenEncoder, ERA5TemporalEncoder, MTGFCIEncoder, MTGSpatialEncoder,
+    LandCoverEmbedder, NdviBackgroundEncoder,
+)
 from .unet import DenoisingUNet2D
+from .lai_head import LAIHead
 
 
 # ──────────────────────────── EDM schedule ───────────────────────────────────
@@ -57,19 +61,49 @@ class EDMDiffusion(pl.LightningModule):
 
     Batch keys consumed
     -------------------
-    ``X``            (B, 6, 3, 256, 256)   MTG FCI conditioning
+    ``X``            (B, 18, 256, 256)     MTG FCI conditioning (15 raw + 3 composite channels)
     ``era5``         (B, 12, 15, 256, 256) ERA5-Land temporal features
     ``target_ndvi``  (B, 1, 256, 256)      NDVI target
     ``loss_weight``  (B, 1, 256, 256)      soft_score (used as uncertainty channel)
+    ``ndvi_monthly`` (B, 1, 128, 128)      MOD13A3 prev-month NDVI — only when ndvi_bg_channels>0
+    ``target_lai``   (B, 1, 256, 256)      LAI target — only consumed when add_lai=True
+    ``lai_mask``     (B, 1, 256, 256)      0 where no real MCD15A3H composite (or QC-bad
+                                            pixel) exists — only consumed when add_lai=True
+    ``target_fpar``  (B, 1, 256, 256)      FAPAR target — only consumed when add_lai=True
+    ``fpar_mask``    (B, 1, 256, 256)      Same semantics as ``lai_mask``, independently
+                                            masked — only consumed when add_lai=True
+
+    Optional LAI/FAPAR head (add_lai=True)
+    ---------------------------------------
+    A deterministic (non-diffusion) ``LAIHead`` reads the same cross-attention
+    context (``ctx``) used by the NDVI denoiser and jointly regresses LAI and
+    FAPAR directly in pixel space, as ``(B, 2, 256, 256)``: channel 0 is LAI
+    (Softplus'd, >=0), channel 1 is FAPAR (Sigmoid'd, in [0,1]). The two
+    variables share the head's hidden trunk — only the final projection is
+    variable-specific — since MCD15A3H retrieves both jointly from the same
+    inputs. Sparse-estimation design, not forecasting: the head predicts
+    ``LAI_t``/``FAPAR_t`` from the same conditioning window used for
+    ``NDVI_t``, supervised only on real MCD15A3H composite dates via masked
+    losses (``lai_mask``/``fpar_mask``), never densified/interpolated. Set
+    add_lai=False (the default) to reproduce the pre-LAI model exactly — no
+    new parameters are created and no LAI/FAPAR keys are read from the batch.
 
     Conditioning architecture
     -------------------------
     Both ERA5 and MTG produce (B, N, D_ctx) token sequences that are concatenated
     and fed into the UNet's cross-attention layers:
-      - MTGFCIEncoder:   (B, 6, 3, 256, 256) → (B, 256, D_ctx)  spatial tokens
+      - MTGFCIEncoder:   (B, 18, 256, 256) → (B, 256, D_ctx)  spatial tokens
       - ERA5TokenEncoder:(B, 12,15, 256, 256) → (B,  15, D_ctx)  temporal tokens
       - combined context: (B, 271, D_ctx)
-    UNet input channels: latent_dim (+ lc_out_channels if land cover enabled).
+    UNet input channels: latent_dim (+ lc_out_channels if land cover enabled)
+                         (+ ndvi_bg_channels if monthly NDVI background enabled).
+
+    Optional MTG spatial branch (mtg_spatial_channels > 0): a second, independent
+    MTG path — MTGSpatialEncoder produces a 32×32 feature map that FiLM/AdaGN-
+    modulates the UNet's hidden state right after conv_in (see unet.SpatialFiLM),
+    rather than entering via cross-attention or channel-concat. Does not change
+    UNet in_channels or the cross-attention context size; disabled by default
+    (0), so checkpoints trained before this option keep loading unchanged.
 
     Parameters
     ----------
@@ -80,8 +114,9 @@ class EDMDiffusion(pl.LightningModule):
         ERA5Source configuration (must match the dataset).
     era5_channels :
         Kept for config backward-compatibility; no longer controls UNet in_channels.
-    mtg_times, mtg_bands :
-        MTG FCI tensor dimensions.
+    mtg_raw_channels, mtg_composite_channels :
+        MTG FCI tensor channel split: 5 timestamps x 3 raw bands (15) plus 3
+        temporal-reliability composites (NDVI75, NDVI_std, CloudScore).
     context_dim :
         Cross-attention context dim (shared between encoders & UNet).
     latent_dim :
@@ -92,6 +127,19 @@ class EDMDiffusion(pl.LightningModule):
         Probability of dropping each conditioning signal for classifier-free guidance.
     lr :
         AdamW learning rate.
+    add_lai :
+        Enable the joint LAI+FAPAR head (default False = identical to the
+        pre-LAI model; no extra parameters, no LAI/FAPAR batch keys read).
+    lai_head_channels, lai_head_blocks, lai_query_size :
+        ``LAIHead`` architecture knobs. Only used when add_lai=True.
+    lai_loss_weight :
+        Multiplier on the combined (LAI + fapar_loss_weight * FAPAR) masked
+        MSE term before adding it to the total training loss ("lambda_aux").
+        Only used when add_lai=True.
+    fapar_loss_weight :
+        Multiplier on the FAPAR term relative to LAI within the combined
+        auxiliary loss ("lambda_fapar"); tune if one task dominates training.
+        Only used when add_lai=True.
     """
 
     def __init__(
@@ -101,8 +149,8 @@ class EDMDiffusion(pl.LightningModule):
         era5_vars: int = 12,
         era5_days: int = 15,
         era5_channels: int = 64,
-        mtg_times: int = 6,
-        mtg_bands: int = 3,
+        mtg_raw_channels: int = 15,
+        mtg_composite_channels: int = 3,
         context_dim: int = 512,
         latent_dim: int = 4,
         sigma_data: float = 1.0,
@@ -111,7 +159,19 @@ class EDMDiffusion(pl.LightningModule):
         lr: float = 1e-4,
         lc_n_classes: int = 18,
         lc_embed_dim: int = 32,
-        lc_out_channels: int = 0,
+        lc_out_channels: int = 32,
+        era5_encoder: str = "spatial",
+        vae_channel_widths: list[int] | None = None,
+        mtg_spatial_channels: int = 0,
+        ndvi_bg_channels: int = 0,
+        add_lai: bool = False,
+        lai_head_channels: int = 128,
+        lai_head_blocks: int = 2,
+        lai_query_size: int = 32,
+        lai_loss_weight: float = 1.0,
+        fapar_loss_weight: float = 1.0,
+        use_soft_mask: bool = True,
+        vae_use_output_norm: bool = True,
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["vae_ckpt"])
@@ -119,8 +179,24 @@ class EDMDiffusion(pl.LightningModule):
         self.lr    = lr
 
         # ── VAE (frozen) ─────────────────────────────────────────────────
-        self.vae = NdviVAEv2(latent_dim=latent_dim) if vae_version == "v2" \
-                   else NdviVAE(latent_dim=latent_dim)
+        # _latent_size: derive from channel_widths when provided (n_downs = len-1),
+        # otherwise fall back to the vae_version heuristic for old configs.
+        if vae_channel_widths:
+            self._latent_size = 256 // (2 ** (len(vae_channel_widths) - 1))
+        else:
+            self._latent_size = 64 if vae_version == "v3" else 32
+        if vae_version == "v2":
+            vae_kwargs = {"latent_dim": latent_dim}
+            if vae_channel_widths:
+                vae_kwargs["channel_widths"] = tuple(vae_channel_widths)
+            self.vae = NdviVAEv2(**vae_kwargs)
+        elif vae_version == "v3":
+            vae_kwargs = {"latent_dim": latent_dim, "use_output_norm": vae_use_output_norm}
+            if vae_channel_widths:
+                vae_kwargs["channel_widths"] = tuple(vae_channel_widths)
+            self.vae = NdviVAEv3(**vae_kwargs)
+        else:
+            self.vae = NdviVAE(latent_dim=latent_dim)
         if vae_ckpt:
             raw = torch.load(vae_ckpt, map_location="cpu")
             sd  = raw.get("state_dict", raw)
@@ -143,18 +219,42 @@ class EDMDiffusion(pl.LightningModule):
         self.register_buffer("latent_scale", scale)
 
         # ── conditioners ─────────────────────────────────────────────────
-        # ERA5: (B,V,T,H,W) → (B, n_days, context_dim) temporal tokens
-        self.era5_enc = ERA5TokenEncoder(era5_vars, era5_days, context_dim)
-        # MTG: (B,T,C,H,W) → (B, 256, context_dim) spatial tokens
-        self.mtg_enc  = MTGFCIEncoder(mtg_times, mtg_bands, context_dim)
-        self.lc_emb   = LandCoverEmbedder(n_classes=lc_n_classes,
-                                           embed_dim=lc_embed_dim,
-                                           out_channels=lc_out_channels)
+        self._era5_encoder = era5_encoder
+        if era5_encoder == "token":
+            # (B,V,T,H,W) → (B, n_days, context_dim) — cross-attention tokens
+            self.era5_enc = ERA5TokenEncoder(era5_vars, era5_days, context_dim)
+            era5_in_ch = 0
+        else:
+            # legacy: (B,V,T,H,W) → (B, era5_channels, 32, 32) — channel concat
+            self.era5_enc = ERA5TemporalEncoder(era5_vars, era5_days, era5_channels)
+            era5_in_ch = era5_channels
 
-        # UNet input: noisy latent + optional LC feature map (ERA5 now via cross-attn)
-        in_ch = latent_dim + self.lc_emb.out_channels
-        self.unet     = DenoisingUNet2D(in_ch, latent_dim, context_dim=context_dim)
+        self.mtg_enc  = MTGFCIEncoder(mtg_raw_channels, mtg_composite_channels, context_dim)
+        self.mtg_spatial_enc = (
+            MTGSpatialEncoder(mtg_raw_channels, mtg_composite_channels, mtg_spatial_channels)
+            if mtg_spatial_channels > 0 else None
+        )
+        self.lc_emb      = LandCoverEmbedder(n_classes=lc_n_classes,
+                                              embed_dim=lc_embed_dim,
+                                              out_channels=lc_out_channels)
+        self.ndvi_bg_enc = NdviBackgroundEncoder(out_channels=ndvi_bg_channels)
+
+        in_ch = latent_dim + era5_in_ch + self.lc_emb.out_channels + self.ndvi_bg_enc.out_channels
+        self.unet     = DenoisingUNet2D(in_ch, latent_dim, context_dim=context_dim,
+                                         mtg_channels=mtg_spatial_channels)
         self.schedule = EDMSchedule(sigma_data)
+
+        # ── optional joint LAI+FAPAR head (sparse estimation, see project memory) ──
+        self.add_lai = add_lai
+        self.lai_loss_weight = lai_loss_weight
+        self.fapar_loss_weight = fapar_loss_weight
+        self.use_soft_mask = use_soft_mask
+        self.lai_head = (
+            LAIHead(context_dim=context_dim, channels=lai_head_channels,
+                    query_size=lai_query_size, n_blocks=lai_head_blocks,
+                    out_channels=2)
+            if add_lai else None
+        )
 
     # ── internal helpers ─────────────────────────────────────────────────────
 
@@ -179,55 +279,122 @@ class EDMDiffusion(pl.LightningModule):
         self, batch: dict,
         drop_mtg: bool = False,
         drop_era5: bool = False,
-    ) -> torch.Tensor:
-        """Encode all conditioning signals and return a combined context token sequence.
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor]:
+        """Encode conditioning signals.
 
         Returns
         -------
-        ctx : (B, 271, D_ctx)
-            Concatenation of MTG spatial tokens (256) and ERA5 temporal tokens (15).
+        era5_feat   : (B, era5_channels, 32, 32) if era5_encoder=="spatial", else None
+        mtg_spatial : (B, mtg_spatial_channels, 32, 32) if mtg_spatial_channels>0, else None
+        ctx         : (B, N_ctx, D_ctx) — MTG tokens [+ ERA5 tokens if era5_encoder=="token"]
         """
         era5 = torch.nan_to_num(batch["era5"], nan=0.0, posinf=0.0, neginf=0.0)
         X    = torch.nan_to_num(batch["X"],    nan=0.0, posinf=0.0, neginf=0.0)
-        era5_tokens = self.era5_enc(era5)   # (B, 15, D_ctx)
-        mtg_tokens  = self.mtg_enc(X)       # (B, 256, D_ctx)
-        if drop_era5:
-            era5_tokens = torch.zeros_like(era5_tokens)
-        if drop_mtg:
-            mtg_tokens = torch.zeros_like(mtg_tokens)
-        return torch.cat([mtg_tokens, era5_tokens], dim=1)  # (B, 271, D_ctx)
+        mtg_tokens = self.mtg_enc(X)  # (B, 256, D_ctx)
+
+        mtg_spatial = self.mtg_spatial_enc(X) if self.mtg_spatial_enc is not None else None
+        if drop_mtg and mtg_spatial is not None:
+            mtg_spatial = torch.zeros_like(mtg_spatial)
+
+        if self._era5_encoder == "token":
+            era5_tokens = self.era5_enc(era5)   # (B, 15, D_ctx)
+            if drop_era5:
+                era5_tokens = torch.zeros_like(era5_tokens)
+            if drop_mtg:
+                mtg_tokens = torch.zeros_like(mtg_tokens)
+            return None, mtg_spatial, torch.cat([mtg_tokens, era5_tokens], dim=1)
+        else:
+            era5_feat = self.era5_enc(era5)     # (B, era5_channels, 32, 32)
+            if drop_era5:
+                era5_feat = torch.zeros_like(era5_feat)
+            if drop_mtg:
+                mtg_tokens = torch.zeros_like(mtg_tokens)
+            return era5_feat, mtg_spatial, mtg_tokens
 
     def _denoiser(
         self,
-        z_noisy: torch.Tensor,                  # (B, latent_dim, 32, 32)
-        sigma: torch.Tensor,                    # (B,)
-        ctx: torch.Tensor,                      # (B, N_ctx, D_ctx)
-        lc_tensor: torch.Tensor | None = None,  # (B, 1, 256, 256)
+        z_noisy: torch.Tensor,                     # (B, latent_dim, 32, 32)
+        sigma: torch.Tensor,                       # (B,)
+        ctx: torch.Tensor,                         # (B, N_ctx, D_ctx)
+        lc_tensor: torch.Tensor | None = None,     # (B, 1, 256, 256)
+        era5_feat: torch.Tensor | None = None,     # (B, era5_ch, 32, 32) legacy only
+        mtg_spatial: torch.Tensor | None = None,   # (B, mtg_spatial_channels, 32, 32)
+        ndvi_bg: torch.Tensor | None = None,       # (B, 1, 128, 128)
     ) -> torch.Tensor:
         sig4d = sigma.view(-1, 1, 1, 1)
         c_skip, c_out, c_in, c_noise = self.schedule.preconditioners(sig4d)
 
         inp = c_in * z_noisy
-        lc  = self.lc_emb(lc_tensor)
+        if era5_feat is not None:
+            inp = torch.cat([inp, era5_feat], dim=1)
+        lc = self.lc_emb(lc_tensor)
         if lc is not None:
             inp = torch.cat([inp, lc], dim=1)
+        bg = self.ndvi_bg_enc(ndvi_bg)
+        if bg is not None:
+            inp = torch.cat([inp, bg], dim=1)
 
-        F_theta = self.unet(inp, c_noise.view(-1), ctx)
+        F_theta = self.unet(inp, c_noise.view(-1), ctx, mtg_feat=mtg_spatial)
         return c_skip * z_noisy + c_out * F_theta
 
     # ── Lightning API ─────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _soft_mask(batch: dict, latent: torch.Tensor) -> torch.Tensor:
-        """Downsample soft_score to latent space (32²) with alpha floor removed.
+    def _soft_mask(self, batch: dict, latent: torch.Tensor) -> torch.Tensor:
+        """Downsample soft_score to latent space with alpha floor removed.
 
         batch["loss_weight"] = soft + alpha*(1-soft) ∈ [0.2, 1.0] (alpha=0.2).
-        Remapping to [0, 1] gives zero weight to pixels outside the MODIS footprint
-        so the model gets no gradient signal there and predicts freely from conditioning.
+        Remapping to [0, 1] gives zero weight to pixels outside the MODIS footprint.
+        When use_soft_mask=False, returns uniform ones (unweighted EDM loss).
         """
+        if not self.use_soft_mask:
+            return torch.ones(latent.shape[0], 1, latent.shape[2], latent.shape[3],
+                              device=latent.device, dtype=latent.dtype)
         soft = batch["loss_weight"].to(latent.device)                          # (B, 1, 256, 256)
-        soft_lat = torch.nn.functional.avg_pool2d(soft, kernel_size=8, stride=8)  # (B, 1, 32, 32)
+        pool_k = 256 // self._latent_size
+        soft_lat = torch.nn.functional.avg_pool2d(soft, kernel_size=pool_k, stride=pool_k)
         return (soft_lat - 0.2).clamp(min=0) / 0.8                            # remap [0.2,1]→[0,1]
+
+    def _lai_loss(self, batch: dict, ctx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Masked MSE for the joint LAI+FAPAR head, computed independently per variable.
+
+        ``lai_mask``/``fpar_mask`` are 0 for pixels with no real MCD15A3H
+        observation — either the whole sample falls on a non-composite date,
+        or the pixel failed QC within a valid composite (see ``LAISource``).
+        LAI and FAPAR are masked independently (their NaN patterns can differ
+        slightly even though both derive from the same ``FparLai_QC`` field),
+        and each is normalised by its own ``mask.sum()`` rather than the full
+        batch size, keeping loss magnitude comparable across batches with
+        different numbers of composite-date samples (~1-in-4 on average).
+
+        Reuses ``ctx`` from the caller's ``_condition()`` call, including
+        whatever CFG dropout was applied for the NDVI branch — a mild, cheap
+        regulariser for the LAI/FAPAR head too, since it never uses CFG at
+        inference (see ``predict_lai``).
+
+        Returns (loss_lai, loss_fapar) — callers combine as
+        ``loss_lai + fapar_loss_weight * loss_fapar``.
+        """
+        required = ("target_lai", "lai_mask", "target_fpar", "fpar_mask")
+        missing = [k for k in required if k not in batch]
+        if missing:
+            raise KeyError(
+                f"add_lai=True but batch is missing {missing} — the joint "
+                "LAI+FAPAR head needs LAISource(..., fpar_band='Fpar_500m') "
+                "passed to AlignedPatchDataset."
+            )
+        pred = self.lai_head(ctx, batch["target_lai"].shape[0])  # (B, 2, H, W)
+
+        target_lai = batch["target_lai"].to(ctx.device)
+        mask_lai   = batch["lai_mask"].to(ctx.device)
+        se_lai     = mask_lai * (pred[:, 0:1] - target_lai).pow(2)
+        loss_lai   = se_lai.sum() / mask_lai.sum().clamp(min=1.0)
+
+        target_fapar = batch["target_fpar"].to(ctx.device)
+        mask_fapar   = batch["fpar_mask"].to(ctx.device)
+        se_fapar     = mask_fapar * (pred[:, 1:2] - target_fapar).pow(2)
+        loss_fapar   = se_fapar.sum() / mask_fapar.sum().clamp(min=1.0)
+
+        return loss_lai, loss_fapar
 
     def training_step(self, batch: dict, _) -> torch.Tensor:
         z     = self._encode_target(batch)
@@ -238,31 +405,52 @@ class EDMDiffusion(pl.LightningModule):
         # Per-batch CFG dropout (independent for each conditioning branch)
         drop_mtg  = bool(torch.rand(()) < self.cfg_p)
         drop_era5 = bool(torch.rand(()) < self.cfg_p)
-        ctx       = self._condition(batch, drop_mtg, drop_era5)
+        era5_feat, mtg_spatial, ctx = self._condition(batch, drop_mtg, drop_era5)
         lc_tensor = batch.get("land_cover")
+        ndvi_bg   = batch.get("ndvi_monthly")
 
-        D_theta   = self._denoiser(z_noisy, sigma, ctx, lc_tensor)
+        D_theta   = self._denoiser(z_noisy, sigma, ctx, lc_tensor, era5_feat, mtg_spatial, ndvi_bg)
         w         = self.schedule.loss_weight(sigma)[:, None, None, None].clamp(max=1e4)
         soft_mask = self._soft_mask(batch, z)
-        loss      = (w * soft_mask * (D_theta - z).pow(2)).mean()
-        loss      = torch.nan_to_num(loss, nan=0.0, posinf=0.0)
+        ndvi_loss = (w * soft_mask * (D_theta - z).pow(2)).mean()
+        ndvi_loss = torch.nan_to_num(ndvi_loss, nan=0.0, posinf=0.0)
+        loss      = ndvi_loss
 
-        self.log("train/loss",       loss,          prog_bar=True, on_step=True, on_epoch=True)
+        self.log("train/ndvi_loss",  ndvi_loss,     on_step=True,  on_epoch=True)
         self.log("train/sigma_mean", sigma.mean(),  on_step=True,  on_epoch=False)
+
+        if self.lai_head is not None:
+            loss_lai, loss_fapar = self._lai_loss(batch, ctx)
+            aux_loss = loss_lai + self.fapar_loss_weight * loss_fapar
+            loss     = loss + self.lai_loss_weight * aux_loss
+            self.log("train/lai_loss",   loss_lai,   on_step=True, on_epoch=True)
+            self.log("train/fapar_loss", loss_fapar, on_step=True, on_epoch=True)
+
+        self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=True)
         return loss
 
     def validation_step(self, batch: dict, _) -> None:
         z       = self._encode_target(batch)
         sigma   = self.schedule.sample_sigma(z.shape[0], z.device)
         z_noisy = z + sigma[:, None, None, None] * torch.randn_like(z)
-        ctx       = self._condition(batch)
+        era5_feat, mtg_spatial, ctx = self._condition(batch)
         lc_tensor = batch.get("land_cover")
-        D_theta   = self._denoiser(z_noisy, sigma, ctx, lc_tensor)
+        ndvi_bg   = batch.get("ndvi_monthly")
+        D_theta   = self._denoiser(z_noisy, sigma, ctx, lc_tensor, era5_feat, mtg_spatial, ndvi_bg)
         w         = self.schedule.loss_weight(sigma)[:, None, None, None].clamp(max=1e4)
         soft_mask = self._soft_mask(batch, z)
-        loss      = (w * soft_mask * (D_theta - z).pow(2)).mean()
-        loss      = torch.nan_to_num(loss, nan=0.0, posinf=0.0)
-        self.log("val/loss", loss, prog_bar=True, on_epoch=True, sync_dist=True)
+        ndvi_loss = (w * soft_mask * (D_theta - z).pow(2)).mean()
+        ndvi_loss = torch.nan_to_num(ndvi_loss, nan=0.0, posinf=0.0)
+        loss      = ndvi_loss
+
+        if self.lai_head is not None:
+            loss_lai, loss_fapar = self._lai_loss(batch, ctx)
+            aux_loss = loss_lai + self.fapar_loss_weight * loss_fapar
+            loss     = loss + self.lai_loss_weight * aux_loss
+            self.log("val/lai_loss",   loss_lai,   on_epoch=True, sync_dist=True)
+            self.log("val/fapar_loss", loss_fapar, on_epoch=True, sync_dist=True)
+
+        self.log("val_loss", loss, prog_bar=True, on_epoch=True, sync_dist=True)
 
     @torch.no_grad()
     def sample(
@@ -275,13 +463,16 @@ class EDMDiffusion(pl.LightningModule):
         rho: float = 7.0,
     ) -> torch.Tensor:
         """DPMPP-2M sampler (Karras 2022). Returns decoded (B, 2, 256, 256)."""
-        ctx_c     = self._condition(batch)                 # (B, 271, D_ctx)
-        ctx_u     = torch.zeros_like(ctx_c)               # null context for CFG
-        lc_tensor = batch.get("land_cover")               # static — same for both CFG branches
+        era5_feat_c, mtg_spatial_c, ctx_c = self._condition(batch)
+        era5_feat_u = torch.zeros_like(era5_feat_c) if era5_feat_c is not None else None
+        mtg_spatial_u = torch.zeros_like(mtg_spatial_c) if mtg_spatial_c is not None else None
+        ctx_u       = torch.zeros_like(ctx_c)
+        lc_tensor   = batch.get("land_cover")
+        ndvi_bg     = batch.get("ndvi_monthly")
 
         B   = batch["X"].shape[0]
         dev = batch["X"].device
-        z   = torch.randn(B, self.hparams.latent_dim, 32, 32, device=dev) * sigma_max
+        z   = torch.randn(B, self.hparams.latent_dim, self._latent_size, self._latent_size, device=dev) * sigma_max
 
         # Karras sigma schedule: geometric ramp in ρ-space
         steps_t = torch.arange(steps + 1, device=dev, dtype=torch.float32)
@@ -294,8 +485,8 @@ class EDMDiffusion(pl.LightningModule):
         old_denoised: torch.Tensor | None = None
         for i in range(steps):
             sig     = sigmas[i].expand(B)
-            D_c     = self._denoiser(z, sig, ctx_c, lc_tensor)
-            D_u     = self._denoiser(z, sig, ctx_u, lc_tensor)
+            D_c     = self._denoiser(z, sig, ctx_c, lc_tensor, era5_feat_c, mtg_spatial_c, ndvi_bg)
+            D_u     = self._denoiser(z, sig, ctx_u, lc_tensor, era5_feat_u, mtg_spatial_u, ndvi_bg)
             D_theta = D_u + guidance * (D_c - D_u)   # CFG blend
 
             t, t_next = sigmas[i], sigmas[i + 1]
@@ -318,6 +509,27 @@ class EDMDiffusion(pl.LightningModule):
 
         return self.vae.decode(self._unnorm_latent(z))   # (B, 2, 256, 256)
 
+    @torch.no_grad()
+    def predict_lai(self, batch: dict) -> torch.Tensor | None:
+        """Deterministic joint LAI+FAPAR prediction — no diffusion sampling loop needed.
+
+        Returns (B, 2, 256, 256): channel 0 = LAI (Softplus'd, >=0),
+        channel 1 = FAPAR (Sigmoid'd, in [0,1]).
+
+        Unlike ``sample()``, this needs no NDVI-conditioning-only batch dict
+        beyond ``X``/``era5`` (whatever ``InferencePatchDataset`` already
+        provides) — the LAI head reads the same conditioning tokens the NDVI
+        denoiser cross-attends into. Uses the full (undropped) context, unlike
+        training where CFG dropout regularises the shared trunk.
+
+        Returns None if add_lai=False.
+        """
+        if self.lai_head is None:
+            return None
+        _, _, ctx = self._condition(batch)
+        B = batch["X"].shape[0]
+        return self.lai_head(ctx, B)
+
     def configure_optimizers(self):
         params = (
             list(self.era5_enc.parameters())
@@ -325,6 +537,10 @@ class EDMDiffusion(pl.LightningModule):
             + list(self.lc_emb.parameters())
             + list(self.unet.parameters())
         )
+        if self.mtg_spatial_enc is not None:
+            params += list(self.mtg_spatial_enc.parameters())
+        if self.lai_head is not None:
+            params += list(self.lai_head.parameters())
         opt   = torch.optim.AdamW(params, lr=self.lr, weight_decay=1e-2)
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(
             opt, T_max=200_000, eta_min=1e-6)
