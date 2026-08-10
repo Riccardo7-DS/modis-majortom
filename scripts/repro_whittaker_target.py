@@ -37,11 +37,18 @@ from modis_majortom.transform.ndvi_whittaker import WhittakerPipeline
 T = 365
 DAYS = np.arange(T)
 DOY = DAYS + 1
-# Window 1: long cloudy run, primary mask misses ~40% of it
+# Window 1: long cloudy run, primary mask misses ~40% of it. Sits on the
+# seasonal plateau so any envelope error is attributable to the window, not
+# to the green-up/senescence slopes.
 W1 = np.arange(150, 176)
-# Window 2: a full detector-month (doy 241..270) of cloud, primary mask
-# catches all but two observations -> fewer than MIN_CLEAR_OBS clear obs
+# Window 2: a full detector-month of cloud. detect_clouds bins months as
+# (doy-1)//30, so doy 241..270 is exactly one bin; anything narrower leaves
+# clear shoulder days inside the bin and the uncertain-month path never
+# fires. The primary mask catches all but two observations, so the bin has
+# 2 < MIN_CLEAR_OBS confident-clear obs.
 W2 = np.arange(240, 270)
+# The two slips are fixed (not seeded) so the leak metric reads the same
+# observations in every run.
 W2_SLIPS = np.array([248, 259])
 
 
@@ -61,12 +68,18 @@ def make_scene(seed: int):
     truth = double_logistic(DAYS)
     y = truth + rng.normal(0, 0.02, T)
 
+    # Scattered 1-day cloud events across the year, 85% caught by the primary
+    # mask. Kept out of doy 235..275 so W2's month stays a controlled
+    # experiment for the uncertain-month path.
     protected = np.concatenate([W1, np.arange(235, 275)])
     idx_short = rng.choice(np.setdiff1d(DAYS, protected), 55, replace=False)
     y[idx_short] -= rng.uniform(0.15, 0.5, idx_short.size)
     weights = np.ones(T)
     weights[idx_short] = (rng.random(idx_short.size) < 0.15).astype(float)
 
+    # W1: every obs contaminated (cloud dips 0.25-0.55 below truth), plus two
+    # bright outliers that pass the mask - the points the envelope latches
+    # onto, and the points that split the suppression run for gap logic.
     y[W1] = truth[W1] - rng.uniform(0.25, 0.55, W1.size)
     spikes = W1[[8, 16]]
     y[spikes] = truth[spikes] + rng.uniform(0.08, 0.15, 2)
@@ -88,9 +101,13 @@ def build_target(pipeline: WhittakerPipeline, y, weights):
     soft*obs + (1-soft)*envelope and soft + 0.2*(1-soft).
     """
     res = pipeline.detect_clouds(y.astype(np.float32), DOY, weights)
+    # soft_score rule of _to_dataset (ndvi_whittaker.py): primary OR algo
+    # cloud -> 0, uncertain month -> 0.5, else 1.
     primary_cloud = weights < 0.5
     is_cloud = primary_cloud | res.cloud_mask
     soft = np.where(is_cloud, 0.0, np.where(res.uncertain_mask, 0.5, 1.0))
+    # target blend of dataset.py (MODISSource): soft*obs + (1-soft)*envelope,
+    # loss weight soft + alpha*(1-soft) with alpha = 0.2.
     target = soft * y + (1.0 - soft) * res.ndvi_smooth.astype(np.float64)
     loss_weight = soft + 0.2 * (1.0 - soft)
     return res, soft, target, loss_weight
