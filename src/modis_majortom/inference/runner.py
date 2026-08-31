@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import logging
-import random
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,7 +16,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from ..model.diffusion import EDMDiffusion
-from ..transform.dataset import ERA5Source
+from ..transform.dataset import ERA5Source, MOD13A3Source
 from ..transform.land_cover import LandCoverSource
 from .dataset import InferencePatchDataset, build_inference_index
 
@@ -35,6 +34,7 @@ class InferenceConfig:
     out_zarr: str = "outputs/ndvi_predictions.zarr"
     out_fig: str = "outputs/inference_preview.png"
     era5_days: int = 15
+    era5_vars: int | None = None
     n_viz: int = 6
     k_draws: int = 5
     batch_size: int = 8
@@ -45,8 +45,10 @@ class InferenceConfig:
     skip_existing: bool = False
     max_samples: int | None = None
     dates: list[str] | None = None
+    grid_ids: list[str] | None = None
     modis_proc_zarr: str | None = None
     lc_zarr: str | None = None
+    mod13a3_zarr: str | None = None
 
 
 class InferenceRunner:
@@ -96,9 +98,19 @@ class InferenceRunner:
         """Load EDMDiffusion from checkpoint, stripping the vae_ckpt hyper-param."""
         log.info("Loading model from %s …", self.cfg.diff_ckpt)
         state = torch.load(self.cfg.diff_ckpt, map_location="cpu")
-        hp = state.get("hyper_parameters", {})
+        hp = dict(state.get("hyper_parameters", {}))
+        sd = state["state_dict"]
+        # Checkpoints trained without era5_encoder hparam always used ERA5TokenEncoder.
+        if "era5_encoder" not in hp:
+            hp["era5_encoder"] = "token" if "era5_enc.proj.weight" in sd else "spatial"
         model = EDMDiffusion(**{k: v for k, v in hp.items() if k != "vae_ckpt"})
-        model.load_state_dict(state["state_dict"], strict=True)
+        model.load_state_dict(sd, strict=True)
+        if "ema_shadow" in state:
+            with torch.no_grad():
+                for name, param in model.named_parameters():
+                    if name in state["ema_shadow"]:
+                        param.data.copy_(state["ema_shadow"][name])
+            log.info("  Applied EMA shadow weights.")
         model = model.to(device).eval()
         log.info("  %.1fM parameters", sum(p.numel() for p in model.parameters()) / 1e6)
         return model
@@ -176,9 +188,9 @@ class InferenceRunner:
 
     @staticmethod
     def _fci_rgb(X: np.ndarray) -> np.ndarray:
-        """(6, 3, H, W) → (H, W, 3) uint8 false-colour from the best FCI frame."""
+        """(18, H, W) → (H, W, 3) uint8 false-colour from the best FCI frame."""
         for i in range(4, -1, -1):
-            fr = X[i]
+            fr = X[i * 3:i * 3 + 3]
             if fr.max() > 0:
                 break
         r = np.clip(fr[0] / 100.0, 0, 1)
@@ -241,7 +253,7 @@ class InferenceRunner:
 
         for row, s in enumerate(viz_samples):
             X, pr, std = s["X"], s["mean_ndvi"], s["std_ndvi"]
-            fci_ndvi = X[5, 0]
+            fci_ndvi = X[15]
             axs = [fig.add_subplot(gs[row, c]) for c in range(n_cols)]
             col = 0
 
@@ -328,6 +340,8 @@ class InferenceRunner:
         model = self.load_model(device)
 
         era5_src = ERA5Source(nc_path=cfg.era5_path, n_days=cfg.era5_days)
+        if cfg.era5_vars is not None:
+            era5_src.variables = era5_src.variables[:cfg.era5_vars]
         skip_set = self._existing_pairs(Path(cfg.out_zarr)) if cfg.skip_existing else None
         if skip_set:
             log.info("Skipping %d already-written samples", len(skip_set))
@@ -336,6 +350,9 @@ class InferenceRunner:
         if cfg.dates:
             allowed = set(cfg.dates)
             samples = [(g, d) for g, d in samples if d in allowed]
+        if cfg.grid_ids:
+            allowed_gids = set(cfg.grid_ids)
+            samples = [(g, d) for g, d in samples if g in allowed_gids]
         log.info("Total inference samples: %d", len(samples))
 
         if not samples:
@@ -382,11 +399,17 @@ class InferenceRunner:
             lc_source = LandCoverSource(zarr_path=cfg.lc_zarr, variables=["LC_Type1"])
             log.info("Land cover source: %s", cfg.lc_zarr)
 
+        mod13a3_source = None
+        if cfg.mod13a3_zarr:
+            mod13a3_source = MOD13A3Source(zarr_path=cfg.mod13a3_zarr)
+            log.info("MOD13A3 source: %s", cfg.mod13a3_zarr)
+
         dataset = InferencePatchDataset(
             fci_store_path=cfg.fci_zarr,
             era5_source=era5_src,
             samples=samples,
             lc_source=lc_source,
+            mod13a3_source=mod13a3_source,
         )
         dl = DataLoader(
             dataset,

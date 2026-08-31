@@ -1,7 +1,10 @@
 notebooks/
 checkpoints/
 solutions/
+scripts/
 data/
+.claude/
+lightning_logs/
 *.pyc
 .env
 *.lock

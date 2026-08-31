@@ -47,13 +47,14 @@ def _detect_pixel(
     lc_k, lc_k_default, min_clear_obs_default, max_pos_residual_default,
     min_abs_residual_default, floor_residual_default,
     llas, half_normal_corr,
+    envelope_p=0.99,
 ):
     """Standalone per-pixel cloud detection callable for process-pool workers.
 
     Mirrors ``WhittakerPipeline.detect_clouds`` but captures all configuration
     as plain arguments so it can be pickled by joblib's process backend.
     """
-    from modape.whittaker import ws2d, ws2doptv
+    from modape.whittaker import ws2doptvp
 
     if min_clear_obs    is None: min_clear_obs    = min_clear_obs_default
     if max_pos_residual is None: max_pos_residual = max_pos_residual_default
@@ -75,15 +76,12 @@ def _detect_pixel(
             np.full(T, np.nan, dtype=np.float32),
         )
 
-    z, lmda = ws2doptv(y, w, llas)
-    z = np.array(z, dtype=np.float64)
-    for _ in range(n_iter):
-        residual_iter = y - z
-        w_new = w.copy()
-        w_new[residual_iter < 0] *= 0.1
-        z = np.array(ws2d(y, lmda, w_new), dtype=np.float64)
-        w = w_new
-    ndvi_smooth = z.astype(np.float32)
+    # Asymmetric upper-envelope fit with V-curve lambda selection.
+    # ws2doptvp convention: p > 0.5 → upper envelope (observations above the
+    # smooth get weight p; observations below get weight 1-p, so cloud dips
+    # with p close to 1 carry weight ~0 and are effectively ignored).
+    z, _ = ws2doptvp(y, w, llas, envelope_p)
+    ndvi_smooth = np.clip(z, -1.0, 1.0).astype(np.float32)
 
     residuals = ndvi_ts.astype(np.float32) - ndvi_smooth
     sigma_by_month: dict[int, float] = {}
@@ -266,15 +264,19 @@ class WhittakerPipeline:
         "cloud_mask_algo", "uncertain_mask", "residuals",
         "cloud_mask_mod35", "cloud_mask_state1km",
         "soft_score",
+        # Whittaker suppression diagnostics (opt-in, from whittaker_features.py)
+        "weight_suppressed", "run_length", "suppressed_fraction_windowed",
+        "forward_gap", "backward_gap", "local_slope", "high_risk",
     })
     DEFAULT_VARIABLES: tuple = ("ndvi_envelope", "soft_score")
 
     # Default log₁₀(λ) search grid for ws2doptv / ws2doptvp.
     # Both functions expect log10-transformed lambda values (not actual lambdas).
-    # Range -1…5 covers λ = 0.1 … 100 000, sufficient for near-daily NDVI.
+    # Range 1…5 covers λ = 10 … 100 000; minimum of 10 prevents end-of-series
+    # boundary runaway in ws2doptvp with asymmetric (upper-envelope) weighting.
     # Step 0.2 gives fine enough resolution for the V-curve to find a good minimum.
     # Must be a Python array.array('d', ...) — ws2doptv rejects numpy arrays.
-    _LLAS = _array.array('d', np.arange(-1, 5, 0.2).round(2).tolist())
+    _LLAS = _array.array('d', np.arange(1, 5, 0.2).round(2).tolist())
 
     def __init__(
         self,
@@ -282,22 +284,24 @@ class WhittakerPipeline:
         path_250: Path | str | None = None,
         path_500: Path | str | None = None,
         path_cloud: Path | str | None = None,
-        state1km_algorithm: str = "binned",
+        state1km_algorithm: str = "cloud_only",
         weight_source: str = "mod35",
         k: float | dict[int, float] | None = None,
+        envelope_p: float = 0.99,
     ) -> None:
         self.product = product          # "MOD09GQ" or "MOD09GA"
         self.path_250   = Path(path_250)   if path_250   else self.DEFAULT_250
         self.path_500   = Path(path_500)   if path_500   else self.DEFAULT_500
         self.path_cloud = Path(path_cloud) if path_cloud else self.DEFAULT_CLOUD
         self.state1km_algorithm = state1km_algorithm
-        if weight_source not in ("mod35", "state1km"):
-            raise ValueError(f"weight_source must be 'mod35' or 'state1km', got {weight_source!r}")
+        if weight_source not in ("mod35", "state1km", "none"):
+            raise ValueError(f"weight_source must be 'mod35', 'state1km', or 'none', got {weight_source!r}")
         self.weight_source = weight_source
         if isinstance(k, dict):
             self.LC_K = k           # per-class lookup table
         elif k is not None:
             self.LC_K_DEFAULT = float(k)   # single value overrides the default
+        self.envelope_p = float(envelope_p)
         self._store_cache: dict[str, zarr.Group] = {}
 
     # ── Private zarr helpers ──────────────────────────────────────────────────
@@ -327,7 +331,7 @@ class WhittakerPipeline:
             return None
         # fill_below=-0.05 masks MODIS fill values before the NIR/Red ratio;
         # clip guards residual outliers from near-zero (but non-zero) denominators.
-        ndvi = compute_ndvi(b02, b01, fill_below=-0.05)
+        ndvi = compute_ndvi(b01, b02, fill_below=-0.05)
         return np.clip(ndvi, -1.0, 1.0)
 
     @staticmethod
@@ -411,21 +415,30 @@ class WhittakerPipeline:
         if cloud_mask and self.weight_source == "mod35":
             patches_cloud = self._open(self.path_cloud)["patches"]
 
-        raw_layers:    list[np.ndarray] = []
-        masked_layers: list[np.ndarray] = []
-        weight_layers: list[np.ndarray] = []
-        valid_dates:   list[str]        = []
+        raw_layers:    list = []
+        masked_layers: list = []
+        weight_layers: list = []
+        valid_dates:   list[str] = []
+        patch_shape:   tuple[int, int] | None = None
+
+        _MISSING = object()  # sentinel for dates with no data
 
         for date in dates:
             ndvi = self._load_ndvi_patch(patches_250, date, grid_id)
             if ndvi is None:
-                log.debug("No NDVI data for %s / %s — skipping", grid_id, date)
+                log.debug("No NDVI data for %s / %s — weight=0 placeholder", grid_id, date)
+                raw_layers.append(_MISSING)
+                masked_layers.append(_MISSING)
+                weight_layers.append(_MISSING)
+                valid_dates.append(date)
                 continue
 
+            if patch_shape is None:
+                patch_shape = ndvi.shape
             raw_layers.append(ndvi.copy())
             w = np.ones(ndvi.shape, dtype=np.float32)   # default: all clear
 
-            if cloud_mask:
+            if cloud_mask and self.weight_source != "none":
                 if self.weight_source == "state1km":
                     cloud = self._load_state1km_mask(date, grid_id)
                 else:
@@ -442,12 +455,22 @@ class WhittakerPipeline:
             weight_layers.append(w)
             valid_dates.append(date)
 
-        if not raw_layers:
+        if patch_shape is None:
             raise ValueError(f"No valid data found for grid_id={grid_id!r} in the requested dates.")
 
-        ndvi_masked = np.stack(masked_layers, axis=0).astype(np.float32)   # (T, H, W)
-        ndvi_raw    = np.stack(raw_layers,    axis=0).astype(np.float32)   # (T, H, W)
-        weights     = np.stack(weight_layers, axis=0).astype(np.float32)   # (T, H, W)
+        H, W = patch_shape
+        nan_patch  = np.full((H, W), np.nan,  dtype=np.float32)
+        zero_patch = np.zeros((H, W),          dtype=np.float32)
+
+        ndvi_masked = np.stack(
+            [nan_patch  if v is _MISSING else v for v in masked_layers], axis=0
+        ).astype(np.float32)
+        ndvi_raw = np.stack(
+            [nan_patch  if v is _MISSING else v for v in raw_layers], axis=0
+        ).astype(np.float32)
+        weights = np.stack(
+            [zero_patch if v is _MISSING else v for v in weight_layers], axis=0
+        ).astype(np.float32)
         return ndvi_masked, ndvi_raw, weights, valid_dates
 
     def smooth_xarray(
@@ -473,8 +496,8 @@ class WhittakerPipeline:
         p:
             Asymmetry parameter for ``ws2doptvp`` (0 < p < 1).
 
-            * ``p < 0.5``  — upper envelope; suppresses cloud dips (p ≈ 0.1).
-            * ``p > 0.5``  — lower envelope.
+            * ``p > 0.5``  — upper envelope; suppresses cloud dips (p ≈ 0.99).
+            * ``p < 0.5``  — lower envelope.
             * ``p = 0.5``  — symmetric (equivalent to ``ws2doptv``).
             * ``None``     — use ``ws2doptv`` (symmetric V-curve, default).
         llas:
@@ -502,7 +525,7 @@ class WhittakerPipeline:
         --------
         >>> pipeline = WhittakerPipeline()
         >>> smoothed = pipeline.smooth_xarray(ndvi_da)                    # symmetric
-        >>> envelope = pipeline.smooth_xarray(ndvi_da, p=0.1)             # upper envelope
+        >>> envelope = pipeline.smooth_xarray(ndvi_da, p=0.99)            # upper envelope
         >>> fine    = pipeline.smooth_xarray(ndvi_da, lambda_min=-2, lambda_max=4)
         """
         import xarray as xr
@@ -579,7 +602,7 @@ class WhittakerPipeline:
         p:
             Asymmetry parameter forwarded to :meth:`smooth_xarray`.
             ``None`` (default) → symmetric ``ws2doptv``.
-            ``p < 0.5`` (e.g. ``0.1``) → upper envelope via ``ws2doptvp``,
+            ``p > 0.5`` (e.g. ``0.99``) → upper envelope via ``ws2doptvp``,
             useful when you want a cloud-suppressed smooth in one pass.
         as_dataset:
             When True, return an ``xr.Dataset`` instead of a bare numpy array.
@@ -731,7 +754,10 @@ class WhittakerPipeline:
         # Missing primary mask pixels (NaN) are treated as uncertain (0.5).
         algo_cloud     = detection["cloud_mask"].values      # bool (T, H, W)
         algo_uncertain = detection["uncertain_mask"].values  # bool (T, H, W)
-        if self.weight_source == "state1km":
+        if self.weight_source == "none":
+            primary_cloud = np.zeros(algo_cloud.shape, dtype=bool)
+            primary_nan   = np.zeros(algo_cloud.shape, dtype=bool)
+        elif self.weight_source == "state1km":
             primary_cloud = state1km_stack > 0.5   # NaN > 0.5 → False in numpy
             primary_nan   = np.isnan(state1km_stack)
         else:
@@ -769,6 +795,66 @@ class WhittakerPipeline:
             "soft_score":          _da(soft_score,
                                        "Cloud soft score (1=confident clear, 0.5=uncertain, 0=cloud)"),
         })
+        # ── Whittaker suppression diagnostics (opt-in) ───────────────────────
+        _DIAG = {
+            "weight_suppressed", "run_length", "suppressed_fraction_windowed",
+            "forward_gap", "backward_gap", "local_slope", "high_risk",
+        }
+        if requested_vars is None or _DIAG & requested_vars:
+            import pandas as pd
+            from modis_majortom.transform.whittaker_features import (
+                weight_suppressed as _wsupp,
+                run_lengths,
+                suppressed_fraction_windowed,
+                forward_backward_gap,
+                local_slope as _lslope,
+                high_risk_mask,
+            )
+            _req = requested_vars if requested_vars is not None else _DIAG
+            _days = (
+                pd.to_datetime(valid_dates) - pd.Timestamp("2000-01-01")
+            ).days.values.astype(np.float32)
+            _z = detection["ndvi_smooth"].values  # (T,H,W)
+            _sup = _wsupp(ndvi_raw, _z, p=self.envelope_p)
+            if "weight_suppressed" in _req:
+                dataset_vars["weight_suppressed"] = _da(
+                    _sup, "Suppression flag: 1 where ws2doptvp down-weighted (y<z or NaN)"
+                )
+            _rl = None
+            if "run_length" in _req or "high_risk" in _req:
+                _rl = run_lengths(_sup)
+            if "run_length" in _req:
+                dataset_vars["run_length"] = _da(
+                    _rl, "Contiguous suppressed run length per timestep (0=clear)",
+                )
+            if "suppressed_fraction_windowed" in _req:
+                dataset_vars["suppressed_fraction_windowed"] = _da(
+                    suppressed_fraction_windowed(_sup, _days),
+                    "Rolling fraction of suppressed obs in a 20-day centred window",
+                )
+            if "forward_gap" in _req or "backward_gap" in _req:
+                _fwd, _bwd = forward_backward_gap(_sup, _days)
+                if "forward_gap" in _req:
+                    dataset_vars["forward_gap"] = _da(
+                        _fwd, "Days to next non-suppressed timestep (0=clear, inf=none)"
+                    )
+                if "backward_gap" in _req:
+                    dataset_vars["backward_gap"] = _da(
+                        _bwd, "Days to previous non-suppressed timestep (0=clear, inf=none)"
+                    )
+            _sl = None
+            if "local_slope" in _req or "high_risk" in _req:
+                _sl = _lslope(_z, _days)
+            if "local_slope" in _req:
+                dataset_vars["local_slope"] = _da(
+                    _sl, "Local slope of smoothed NDVI (NDVI/day, 5-day window)",
+                )
+            if "high_risk" in _req:
+                dataset_vars["high_risk"] = _da(
+                    high_risk_mask(_rl, _sl),
+                    "High-risk flag: run_length>4 AND |slope| in top-10% per pixel",
+                )
+
         return xr.Dataset(dataset_vars)
 
     def detect_clouds(
@@ -833,7 +919,7 @@ class WhittakerPipeline:
         CloudDetectionResult
             cloud_mask, uncertain_mask, ndvi_smooth, residuals.
         """
-        from modape.whittaker import ws2d, ws2doptv  # lazy import — optional dependency
+        from modape.whittaker import ws2doptvp  # lazy import — optional dependency
 
         if min_clear_obs is None:
             min_clear_obs = self.MIN_CLEAR_OBS
@@ -850,8 +936,7 @@ class WhittakerPipeline:
         # doy 1–31 → month 1, …, 335–365 → month 12.
         month = np.clip((doy - 1) // 30, 0, 11).astype(np.int32) + 1  # (T,)
 
-        # ── Step 1: asymmetric iterative Whittaker smoother ───────────────────
-        # Start from the supplied weights; zero out NaN positions.
+        # ── Step 1: asymmetric upper-envelope Whittaker smoother ─────────────
         w = mod_weights.astype(np.float64).copy()
         w[np.isnan(ndvi_ts)] = 0.0
 
@@ -865,23 +950,13 @@ class WhittakerPipeline:
                 residuals=np.full(T, np.nan, dtype=np.float32),
             )
 
-        # Find the per-pixel optimal λ via V-curve, then use it for all
-        # asymmetric iterations — no global fixed λ required.
-        # ws2doptv returns sopt as the actual optimal λ value (not log10),
-        # so it can be passed directly to ws2d.
-        z, lmda = ws2doptv(y, w, self._LLAS)
-        z = np.array(z, dtype=np.float64)
-
-        for _ in range(n_iter):
-            residual_iter = y - z
-            # Cloud dips sit below the envelope (negative residuals).
-            # Soft-penalise them so the smoother tracks the clear-sky surface.
-            w_new = w.copy()
-            w_new[residual_iter < 0] *= 0.1
-            z = np.array(ws2d(y, lmda, w_new), dtype=np.float64)
-            w = w_new
-
-        ndvi_smooth = z.astype(np.float32)
+        # Asymmetric upper-envelope fit with V-curve lambda selection.
+        # ws2doptvp: p > 0.5 → upper envelope. With p=0.99 observations above
+        # the smooth carry weight 0.99 (tracked closely) while observations below
+        # (cloud dips) carry weight 0.01 (largely ignored). Iterates internally
+        # up to 10 times until convergence.
+        z, _ = ws2doptvp(y, w, self._LLAS, self.envelope_p)
+        ndvi_smooth = np.clip(z, -1.0, 1.0).astype(np.float32)
 
         # ── Step 2: residuals ─────────────────────────────────────────────────
         residuals = ndvi_ts.astype(np.float32) - ndvi_smooth  # (T,)
@@ -1002,6 +1077,7 @@ class WhittakerPipeline:
                 self.MIN_CLEAR_OBS, self.MAX_POS_RESIDUAL,
                 self.MIN_ABS_RESIDUAL, self.FLOOR_RESIDUAL,
                 self._LLAS, self._HALF_NORMAL_CORR,
+                self.envelope_p,
             )
             for i in range(N)
         )
@@ -1187,8 +1263,14 @@ class WhittakerPipeline:
         ref_var = "sur_refl_b01"
         all_dates    = sorted(src_patches[ref_var].keys()) \
                        if dates    is None else list(dates)
-        all_grid_ids = sorted(src_patches[ref_var][all_dates[0]].keys()) \
-                       if grid_ids is None else list(grid_ids)
+        if grid_ids is None:
+            all_grid_ids = sorted({
+                g
+                for d in all_dates
+                for g in src_patches[ref_var][d].keys()
+            })
+        else:
+            all_grid_ids = list(grid_ids)
 
         log.info(
             "process_zarr: %d grids × %d dates → %s  variables=%s",

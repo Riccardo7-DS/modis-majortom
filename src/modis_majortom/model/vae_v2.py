@@ -21,6 +21,23 @@ import pytorch_lightning as pl
 # ──────────────────────────── loss helpers ────────────────────────────────────
 
 
+def _sobel_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """L1 loss between Sobel gradient magnitudes. Input: single-channel float."""
+    pred, target = pred.float(), target.float()
+    device = pred.device
+    Kx = torch.tensor([[-1., 0., 1.], [-2., 0., 2.], [-1., 0., 1.]],
+                      device=device).view(1, 1, 3, 3)
+    Ky = torch.tensor([[-1., -2., -1.], [0., 0., 0.], [1., 2., 1.]],
+                      device=device).view(1, 1, 3, 3)
+
+    def grad_mag(x: torch.Tensor) -> torch.Tensor:
+        gx = F.conv2d(x, Kx, padding=1)
+        gy = F.conv2d(x, Ky, padding=1)
+        return (gx.pow(2) + gy.pow(2) + 1e-8).sqrt()
+
+    return F.l1_loss(grad_mag(pred), grad_mag(target))
+
+
 def _ssim_loss(pred: torch.Tensor, target: torch.Tensor, window: int = 11) -> torch.Tensor:
     """1 − mean SSIM (lower = better). Operates on a single-channel tensor.
 
@@ -158,6 +175,162 @@ class NdviVAEv2(nn.Module):
 # ──────────────────────────── Lightning module ────────────────────────────────
 
 
+class NdviVAEv3(nn.Module):
+    """4× spatial compression: 256×256×2 ↔ 64×64×16 with U-Net skip connections.
+
+    Two improvements over NdviVAEv2:
+    - 2 downsampling stages (vs 3) → latent is 64×64, not 32×32.  Features as
+      small as ~4 px at 256×256 survive the bottleneck.
+    - U-Net skip connections carry encoder feature maps to matching decoder scales,
+      bypassing KL regularisation for fine spatial detail (water bodies, field
+      edges).  Skip dropout (p=0.5 during training) ensures the latent remains
+      self-sufficient so the decoder works at diffusion-inference time when no
+      encoder image is available.
+
+    API identical to NdviVAEv2: encode() → (z, mu, logvar), decode(z) → recon,
+    forward() → (recon, mu, logvar).  Skips are stored transiently on the instance
+    between encode() and decode() calls within the same forward pass.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 2,
+        latent_dim: int = 16,
+        channel_widths: tuple = (64, 128, 256),
+        skip_drop_prob: float = 0.5,
+        use_output_norm: bool = True,
+    ):
+        super().__init__()
+        cw = list(channel_widths)
+        n_down = len(cw) - 1  # number of downsampling stages (= 2)
+        self.skip_drop_prob = skip_drop_prob
+        self._enc_skips: list | None = None
+
+        # ── Encoder ───────────────────────────────────────────────────────────
+        # Each stage: Downsample+1×1 first, then ResBlock → save skip here.
+        # Skips are therefore at (cw[i+1], H/2^(i+1), W/2^(i+1)) — avoids the
+        # huge 256×256 tensor that a pre-downsample skip would produce.
+        self.enc_in = nn.Conv2d(in_channels, cw[0], 3, padding=1, padding_mode="reflect")
+        self.enc_downs  = nn.ModuleList()
+        self.enc_blocks = nn.ModuleList()
+        for i in range(n_down):
+            self.enc_downs.append(nn.Sequential(
+                _Downsample(cw[i]),
+                nn.Conv2d(cw[i], cw[i + 1], 1),
+            ))
+            self.enc_blocks.append(_ResBlock(cw[i + 1], cw[i + 1]))
+
+        self.enc_mid = nn.Sequential(
+            _ResBlock(cw[-1], cw[-1]),
+            _ResBlock(cw[-1], cw[-1]),
+        )
+        self.mu_head     = nn.Conv2d(cw[-1], latent_dim, 1)
+        self.logvar_head = nn.Conv2d(cw[-1], latent_dim, 1)
+
+        # ── Decoder ───────────────────────────────────────────────────────────
+        self.dec_in = nn.Sequential(
+            nn.Conv2d(latent_dim, cw[-1], 3, padding=1, padding_mode="reflect"),
+            _ResBlock(cw[-1], cw[-1]),
+        )
+        # Stages in reverse order: merge skip → ResBlock → Upsample+1×1
+        # dec_merges[0] handles the deepest skip (same spatial as z),
+        # dec_merges[1] handles the shallowest skip (2× spatial).
+        self.dec_merges = nn.ModuleList()
+        self.dec_blocks = nn.ModuleList()
+        self.dec_ups    = nn.ModuleList()
+        for i in range(n_down - 1, -1, -1):
+            self.dec_merges.append(nn.Conv2d(cw[i + 1] * 2, cw[i + 1], 1))
+            self.dec_blocks.append(_ResBlock(cw[i + 1], cw[i + 1]))
+            self.dec_ups.append(nn.Sequential(
+                _Upsample(cw[i + 1]),
+                nn.Conv2d(cw[i + 1], cw[i], 1),
+            ))
+
+        # GroupNorm here zeros the feature-map mean, discarding amplitude info.
+        # use_output_norm=False removes it so the decoder can preserve NDVI scale.
+        out_layers: list[nn.Module] = []
+        if use_output_norm:
+            out_layers.append(nn.GroupNorm(min(8, cw[0]), cw[0]))
+        out_layers += [nn.SiLU(), nn.Conv2d(cw[0], in_channels, 3, padding=1, padding_mode="reflect")]
+        self.dec_out = nn.Sequential(*out_layers)
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _make_zero_skips(self, z: torch.Tensor) -> list:
+        """Zero-filled skip tensors for inference (no encoder image available).
+
+        Shapes are derived from the merge-conv in_channels so the formula is
+        correct regardless of channel_widths or n_down.
+        """
+        B, _, H, W = z.shape
+        n = len(self.dec_merges)
+        # enc skips[j] (j=0..n-1) is processed by dec_merges[n-1-j] via reversed().
+        # skip_ch  = dec_merges[n-1-j].in_channels // 2
+        # spatial  = (H * 2^(n-1-j), W * 2^(n-1-j))
+        return [
+            torch.zeros(
+                B,
+                self.dec_merges[n - 1 - j].in_channels // 2,
+                H * (2 ** (n - 1 - j)),
+                W * (2 ** (n - 1 - j)),
+                device=z.device,
+                dtype=z.dtype,
+            )
+            for j in range(n)
+        ]
+
+    # ── forward ───────────────────────────────────────────────────────────────
+
+    def encode(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        h = self.enc_in(x)
+        skips: list[torch.Tensor] = []
+        for down, block in zip(self.enc_downs, self.enc_blocks):
+            h = down(h)
+            h = block(h)
+            skips.append(h)
+
+        h = self.enc_mid(h)
+        mu     = self.mu_head(h)
+        logvar = self.logvar_head(h).clamp(-30, 20)
+        eps    = torch.randn_like(mu) if self.training else torch.zeros_like(mu)
+        z      = mu + eps * (0.5 * logvar).exp()
+
+        # Skip dropout: zero out all skips with probability skip_drop_prob so
+        # the decoder and latent learn to work without them (inference-safe).
+        if self.training and torch.rand(1).item() < self.skip_drop_prob:
+            self._enc_skips = [torch.zeros_like(s) for s in skips]
+        else:
+            self._enc_skips = skips
+
+        return z, mu, logvar
+
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        h = self.dec_in(z)
+
+        if self._enc_skips is not None:
+            skips = self._enc_skips
+            self._enc_skips = None
+        else:
+            skips = self._make_zero_skips(z)
+
+        for merge, block, up, skip in zip(
+            self.dec_merges, self.dec_blocks, self.dec_ups, reversed(skips)
+        ):
+            h = merge(torch.cat([h, skip], dim=1))
+            h = block(h)
+            h = up(h)
+
+        return self.dec_out(h)
+
+    def forward(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        z, mu, logvar = self.encode(x)
+        return self.decode(z), mu, logvar
+
+
 class NdviVAEv2Module(pl.LightningModule):
     """Lightning wrapper with SSIM + L1 + MSE reconstruction loss + β-KL annealing.
 
@@ -176,6 +349,11 @@ class NdviVAEv2Module(pl.LightningModule):
         beta_anneal_steps: int = 5000,
         lambda_ssim: float = 0.15,
         lambda_l1: float = 0.10,
+        lambda_sobel: float = 0.0,
+        lambda_amp: float = 0.0,
+        amp_weight_slope: float = 2.0,
+        ndvi_mean: float = 0.3,
+        ndvi_alpha: float = 0.0,
     ):
         super().__init__()
         self.vae               = vae or NdviVAEv2()
@@ -184,6 +362,13 @@ class NdviVAEv2Module(pl.LightningModule):
         self.beta_anneal_steps = beta_anneal_steps
         self.lambda_ssim       = lambda_ssim
         self.lambda_l1         = lambda_l1
+        self.lambda_sobel      = lambda_sobel
+        self.lambda_amp        = lambda_amp
+        self.amp_weight_slope  = amp_weight_slope
+        self.ndvi_mean         = ndvi_mean
+        self.ndvi_alpha        = ndvi_alpha
+        self._val_gt_means:   list[torch.Tensor] = []
+        self._val_pred_means: list[torch.Tensor] = []
 
     def _beta(self) -> float:
         t = min(self.global_step / max(self.beta_anneal_steps, 1), 1.0)
@@ -193,22 +378,59 @@ class NdviVAEv2Module(pl.LightningModule):
         target = torch.cat([batch["target_ndvi"], batch["loss_weight"]], dim=1)
         recon, mu, logvar = self.vae(target)
 
-        mse  = F.mse_loss(recon, target)
-        ssim = _ssim_loss(recon[:, :1], target[:, :1])   # NDVI channel only
-        l1   = F.l1_loss(recon[:, :1], target[:, :1])    # NDVI channel only
+        ndvi_pred   = recon[:, :1]
+        ndvi_target = target[:, :1]
 
-        loss_recon = mse + self.lambda_ssim * ssim + self.lambda_l1 * l1
-        kl         = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).mean()
-        loss       = loss_recon + self._beta() * kl
+        # pixel-wise weight: higher at NDVI extremes, minimum at dataset mean
+        if self.ndvi_alpha > 0.0:
+            w = (1.0 + self.ndvi_alpha * (ndvi_target - self.ndvi_mean).abs()).float()
+            wmse = (w * (ndvi_pred - ndvi_target).float().pow(2)).mean()
+            wl1  = (w * (ndvi_pred - ndvi_target).float().abs()).mean()
+        else:
+            wmse = F.mse_loss(ndvi_pred, ndvi_target)
+            wl1  = F.l1_loss(ndvi_pred, ndvi_target)
 
-        psnr = -10.0 * torch.log10(mse.detach().clamp(min=1e-10))
+        wmse_total = wmse
+
+        ssim  = _ssim_loss(ndvi_pred, ndvi_target)
+        sobel = _sobel_loss(ndvi_pred, ndvi_target) if self.lambda_sobel > 0.0 else ndvi_pred.new_tensor(0.0)
+
+        # patch-level amplitude loss: penalises mean(recon) != mean(GT) per sample
+        # Weighted by GT NDVI level: amp_weight=1 at low NDVI, up to 3 at very_high (>0.5).
+        # Directly targets the high-NDVI amplitude collapse without changing low-NDVI gradients.
+        amp_gt   = ndvi_target.mean(dim=[-2, -1])   # (B,) — GT patch mean NDVI
+        amp_pred = ndvi_pred.mean(dim=[-2, -1])     # (B,) — predicted patch mean NDVI
+        if self.lambda_amp > 0.0:
+            amp_weight = (1.0 + self.amp_weight_slope * torch.relu(amp_gt - 0.5))
+            amp = (amp_weight * (amp_pred - amp_gt).pow(2)).mean()
+        else:
+            amp = ndvi_pred.new_tensor(0.0)
+
+        if stage == "val":
+            self._val_gt_means.append(amp_gt.detach())
+            self._val_pred_means.append(amp_pred.detach())
+
+        loss_recon = (wmse_total
+                      + self.lambda_ssim  * ssim
+                      + self.lambda_l1    * wl1
+                      + self.lambda_sobel * sobel
+                      + self.lambda_amp   * amp)
+        kl   = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).mean()
+        loss = loss_recon + self._beta() * kl
+
+        # plain MSE on NDVI channel for PSNR tracking (comparable across runs)
+        mse_plain = F.mse_loss(ndvi_pred.detach(), ndvi_target)
+        psnr = -10.0 * torch.log10(mse_plain.clamp(min=1e-10))
+
         sync = (stage == "val")
-        self.log(f"{stage}/recon", loss_recon, prog_bar=True,             sync_dist=sync)
-        self.log(f"{stage}/mse",   mse,                                   sync_dist=sync)
-        self.log(f"{stage}/ssim",  ssim,                                  sync_dist=sync)
-        self.log(f"{stage}/kl",    kl,                                    sync_dist=sync)
-        self.log(f"{stage}/loss",  loss,        prog_bar=True,             sync_dist=sync)
-        self.log(f"{stage}/psnr",  psnr,        prog_bar=(stage == "val"), sync_dist=sync)
+        self.log(f"{stage}/recon",  loss_recon, prog_bar=True,             sync_dist=sync)
+        self.log(f"{stage}/mse",    mse_plain,                             sync_dist=sync)
+        self.log(f"{stage}/ssim",   ssim,                                  sync_dist=sync)
+        self.log(f"{stage}/sobel",  sobel,                                 sync_dist=sync)
+        self.log(f"{stage}/amp",    amp,                                   sync_dist=sync)
+        self.log(f"{stage}/kl",     kl,                                    sync_dist=sync)
+        self.log(f"{stage}/loss",   loss,        prog_bar=True,             sync_dist=sync)
+        self.log(f"{stage}/psnr",   psnr,        prog_bar=(stage == "val"), sync_dist=sync)
         if stage == "train":
             self.log("train/beta", self._beta())
         return loss
@@ -218,6 +440,45 @@ class NdviVAEv2Module(pl.LightningModule):
 
     def validation_step(self, batch: dict, _) -> None:
         self._step(batch, "val")
+
+    def on_validation_epoch_end(self) -> None:
+        if not self._val_gt_means:
+            return
+
+        gt   = self.all_gather(torch.cat(self._val_gt_means)).flatten()
+        pred = self.all_gather(torch.cat(self._val_pred_means)).flatten()
+        self._val_gt_means.clear()
+        self._val_pred_means.clear()
+
+        _BINS = [(-0.2, 0.2, "low"), (0.2, 0.5, "mid"), (0.5, 0.7, "high"), (0.7, 1.1, "very_high")]
+
+        # per-bin bias scalars — logged on all ranks (same values after all_gather)
+        for lo, hi, label in _BINS:
+            mask = (gt >= lo) & (gt < hi)
+            if mask.sum() > 0:
+                self.log(f"val/bias_{label}", (pred[mask] - gt[mask]).mean(), sync_dist=False)
+
+        if not self.trainer.is_global_zero:
+            return
+
+        # histograms: amp_gt vs amp_pred distributions (TensorBoard only)
+        if self.logger and hasattr(self.logger, "experiment"):
+            exp = self.logger.experiment
+            if hasattr(exp, "add_histogram"):
+                step = self.global_step
+                exp.add_histogram("val/amp_gt",   gt.cpu(),   step)
+                exp.add_histogram("val/amp_pred", pred.cpu(), step)
+
+        header = f"{'bin':<10} {'n':>5} {'GT mean':>9} {'pred mean':>10} {'bias':>8}"
+        rows = [header, "─" * len(header)]
+        for lo, hi, label in _BINS:
+            mask = (gt >= lo) & (gt < hi)
+            if mask.sum() == 0:
+                continue
+            gt_m   = gt[mask].mean().item()
+            pred_m = pred[mask].mean().item()
+            rows.append(f"{label:<10} {int(mask.sum()):>5} {gt_m:>9.4f} {pred_m:>10.4f} {pred_m - gt_m:>+8.4f}")
+        print(f"\n[amp bias @ step {self.global_step}]\n" + "\n".join(rows) + "\n")
 
     def configure_optimizers(self):
         opt   = torch.optim.AdamW(self.vae.parameters(), lr=self.lr, weight_decay=1e-4)

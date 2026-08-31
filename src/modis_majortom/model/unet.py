@@ -16,6 +16,11 @@ Architecture (default channel_mult=(256,384,512,512)):
 
 Timestep conditioning via AdaGroupNorm (scale + shift from sinusoidal embedding).
 Cross-attention context comes from MTGFCIEncoder (B, 256 tokens, D_ctx).
+
+Optional MTG spatial branch (mtg_channels > 0): a 32×32 feature map from
+conditioning.MTGSpatialEncoder FiLM/AdaGN-modulates h once, right after
+conv_in, via SpatialFiLM (spatially-varying GroupNorm scale+shift, zero-init).
+Independent of the MTGFCIEncoder token branch above — no shared weights.
 """
 from __future__ import annotations
 
@@ -67,6 +72,34 @@ class AdaGroupNorm(nn.Module):
         # emb: (B, emb_dim) → scale/shift: (B, c)
         scale, shift = self.proj(emb).chunk(2, dim=-1)
         return self.norm(x) * (1 + scale[:, :, None, None]) + shift[:, :, None, None]
+
+
+class SpatialFiLM(nn.Module):
+    """GroupNorm modulated by per-pixel scale+shift predicted from a spatial
+    conditioning map. Like AdaGroupNorm but spatially-varying (SPADE-style)
+    instead of a single vector broadcast uniformly over the feature map —
+    used for the optional MTG spatial branch, which carries per-location
+    information (see conditioning.MTGSpatialEncoder).
+
+    proj is zero-initialised so the conditioning content contributes nothing
+    at construction time (ControlNet-style "zero conv"): scale=shift=0, so
+    training starts as if the branch weren't there and its influence grows
+    in gradually. Note this still applies GroupNorm to x unconditionally, so
+    it is not a strict identity on x the way a residual add would be.
+    """
+
+    def __init__(self, c: int, cond_channels: int):
+        super().__init__()
+        self.norm = nn.GroupNorm(8, c, affine=False)
+        self.proj = nn.Conv2d(cond_channels, 2 * c, 1)
+        nn.init.zeros_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        scale, shift = self.proj(cond).chunk(2, dim=1)  # (B, c, H, W) each
+        # tanh bounds scale to (-1, 1) → multiplicative factor in (0, 2), preventing
+        # unbounded growth of proj weights from destabilising the hidden state.
+        return self.norm(x) * (1 + torch.tanh(scale)) + shift
 
 
 class ResBlock(nn.Module):
@@ -182,6 +215,12 @@ class DenoisingUNet2D(nn.Module):
         Dimension of the timestep embedding MLP output.
     context_dim :
         Cross-attention context dimension (from MTGFCIEncoder).
+    mtg_channels :
+        Channel width of the optional MTG spatial conditioning map (from
+        conditioning.MTGSpatialEncoder). 0 (default) disables the branch —
+        no SpatialFiLM submodule is created, and forward() ignores mtg_feat.
+        When > 0, the map FiLM/AdaGN-modulates the hidden state once, right
+        after conv_in, at the model's native 32×32 resolution.
     """
 
     def __init__(
@@ -191,12 +230,14 @@ class DenoisingUNet2D(nn.Module):
         channel_mult: tuple = (256, 384, 512, 512),
         emb_dim: int = 1024,
         context_dim: int = 512,
+        mtg_channels: int = 0,
     ):
         super().__init__()
         cw = channel_mult
 
         self.time_emb = TimestepEmbedder(emb_dim=emb_dim)
         self.conv_in  = nn.Conv2d(in_channels, cw[0], 3, padding=1, padding_mode="reflect")
+        self.mtg_film = SpatialFiLM(cw[0], mtg_channels) if mtg_channels > 0 else None
 
         # ── encoder ──────────────────────────────────────────────────────
         # Level 0: 32×32, C=cw[0]
@@ -274,9 +315,12 @@ class DenoisingUNet2D(nn.Module):
         x: torch.Tensor,       # (B, in_channels, 32, 32)
         t: torch.Tensor,       # (B,) EDM c_noise = sigma.log()/4
         context: torch.Tensor, # (B, N_ctx, D_ctx) from MTGFCIEncoder
+        mtg_feat: torch.Tensor | None = None,  # (B, mtg_channels, 32, 32), optional
     ) -> torch.Tensor:
         emb = self.time_emb(t)   # (B, emb_dim)
         h   = self.conv_in(x)    # (B, cw[0], 32, 32)
+        if mtg_feat is not None:
+            h = self.mtg_film(h, mtg_feat)
 
         # Encoder — save skips after attention (not after downsampling)
         for blk in self.down0:

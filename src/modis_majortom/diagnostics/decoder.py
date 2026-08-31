@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import logging
 import random
-from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -390,7 +389,7 @@ class V2DecoderInference:
             axs = [fig.add_subplot(gs[row, c]) for c in range(4)]
             axs[0].imshow(InferenceRunner._fci_rgb(X))
             axs[0].set_ylabel(f"{s['grid_id']}\n{s['date']}", fontsize=6.5)
-            cb(axs[1], axs[1].imshow(X[5, 0], **_NDVI_KW))
+            cb(axs[1], axs[1].imshow(X[15], **_NDVI_KW))
             cb(axs[2], axs[2].imshow(pr, **_NDVI_KW))
             cb(axs[3], axs[3].imshow(std, cmap="plasma", vmin=0,
                                       vmax=max(float(std.max()), 0.01)), "%.3f")

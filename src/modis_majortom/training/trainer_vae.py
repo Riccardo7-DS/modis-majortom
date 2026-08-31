@@ -1,14 +1,15 @@
 """VaeTrainer — encapsulates the VAE training loop for NdviVAE v1 and v2."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import torch
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
-from torch.utils.data import DataLoader, random_split
+from pytorch_lightning.strategies import DDPStrategy
+from torch.utils.data import DataLoader
 
 from ..transform.dataset import (
     AlignedPatchDataset,
@@ -16,6 +17,7 @@ from ..transform.dataset import (
     RawGAMODISSource,
     build_sample_index,
 )
+from .trainer_diffusion import _compute_ndvi_weights, _expand_samples_by_ndvi
 
 
 @dataclass
@@ -25,6 +27,11 @@ class VaeDataConfig:
     modis_raw_zarr: str
     modis_proc_zarr: str | None = None
     max_fci_nan_fraction: float = 1.0
+    max_ndvi_lap_var: float = 0.0         # Laplacian-variance threshold; 0.0 = disabled
+    ndvi_oversample: float = 0.0          # expand train set by this factor; 0 = disabled
+    ndvi_oversample_mode: str = "mean"    # "mean" | "frac_above"
+    ndvi_oversample_threshold: float = 0.5  # pixel threshold for "frac_above" mode
+    ndvi_oversample_alpha: float = 1.0    # weight = raw_score ** alpha; >1 = more aggressive
 
 
 @dataclass
@@ -37,11 +44,17 @@ class VaeTrainConfig:
     beta_anneal_steps: int = 5000
     val_every: int = 2000
     max_steps: int = 100_000
+    early_stopping_patience: int = 40
     precision: str = "bf16-mixed"
     seed: int = 42
     # v2-specific loss weights (ignored for v1)
     lambda_ssim: float = 0.15
     lambda_l1: float = 0.10
+    lambda_sobel: float = 0.0
+    lambda_amp: float = 0.0
+    amp_weight_slope: float = 2.0
+    ndvi_mean: float = 0.3
+    ndvi_alpha: float = 0.0
 
     @classmethod
     def from_dict(cls, d: dict) -> "VaeTrainConfig":
@@ -66,8 +79,8 @@ class VaeTrainer:
         model_cfg: dict[str, Any],
         model_version: str = "v1",
     ) -> None:
-        if model_version not in ("v1", "v2"):
-            raise ValueError(f"model_version must be 'v1' or 'v2', got {model_version!r}")
+        if model_version not in ("v1", "v2", "v3"):
+            raise ValueError(f"model_version must be 'v1', 'v2', or 'v3', got {model_version!r}")
         self.data_cfg = data_cfg
         self.train_cfg = train_cfg
         self.model_cfg = model_cfg
@@ -79,7 +92,10 @@ class VaeTrainer:
         """Build train and validation DataLoaders.
 
         The train/val split is seeded with ``train_cfg.seed`` to keep it
-        reproducible across runs. Changing ``seed`` will produce a different split.
+        reproducible across runs.  When ``data_cfg.ndvi_oversample > 0``, the
+        train sample list is expanded by repeating high-NDVI patches proportionally
+        to their NDVI score (see ``_expand_samples_by_ndvi``).  The val set is
+        never oversampled.
         """
         if self.data_cfg.modis_proc_zarr:
             modis_src = MODISSource(
@@ -94,20 +110,40 @@ class VaeTrainer:
             fci_store_path=self.data_cfg.fci_zarr,
             ancillary_sources=ancillary,
             max_fci_nan_fraction=self.data_cfg.max_fci_nan_fraction,
+            max_ndvi_lap_var=self.data_cfg.max_ndvi_lap_var,
         )
         if not samples:
             raise RuntimeError("No (grid_id, date) samples found — check zarr paths in config.")
 
+        # Deterministic train/val split at the sample-list level so oversampling
+        # only affects train without leaking into val.
+        rng = np.random.default_rng(self.train_cfg.seed)
+        idx = rng.permutation(len(samples))
         n_val = max(1, int(len(samples) * 0.05))
-        n_train = len(samples) - n_val
-        dataset = AlignedPatchDataset(
+        val_samples   = [samples[i] for i in idx[:n_val]]
+        train_samples = [samples[i] for i in idx[n_val:]]
+
+        if self.data_cfg.ndvi_oversample > 0.0 and self.data_cfg.modis_proc_zarr:
+            weights = _compute_ndvi_weights(
+                train_samples,
+                self.data_cfg.modis_proc_zarr,
+                mode=self.data_cfg.ndvi_oversample_mode,
+                threshold=self.data_cfg.ndvi_oversample_threshold,
+                alpha=self.data_cfg.ndvi_oversample_alpha,
+            )
+            train_samples = _expand_samples_by_ndvi(
+                train_samples, weights, self.data_cfg.ndvi_oversample,
+            )
+
+        ds_train = AlignedPatchDataset(
             fci_store_path=self.data_cfg.fci_zarr,
             ancillary_sources=ancillary,
-            samples=samples,
+            samples=train_samples,
         )
-        ds_train, ds_val = random_split(
-            dataset, [n_train, n_val],
-            generator=torch.Generator().manual_seed(self.train_cfg.seed),
+        ds_val = AlignedPatchDataset(
+            fci_store_path=self.data_cfg.fci_zarr,
+            ancillary_sources=ancillary,
+            samples=val_samples,
         )
 
         dl_kwargs = dict(
@@ -133,7 +169,7 @@ class VaeTrainer:
                 beta_final=self.train_cfg.beta_final,
                 beta_anneal_steps=self.train_cfg.beta_anneal_steps,
             )
-        else:
+        elif self.model_version == "v2":
             from ..model.vae_v2 import NdviVAEv2, NdviVAEv2Module
             return NdviVAEv2Module(
                 vae=NdviVAEv2(**self.model_cfg),
@@ -142,6 +178,26 @@ class VaeTrainer:
                 beta_anneal_steps=self.train_cfg.beta_anneal_steps,
                 lambda_ssim=self.train_cfg.lambda_ssim,
                 lambda_l1=self.train_cfg.lambda_l1,
+                lambda_sobel=self.train_cfg.lambda_sobel,
+                lambda_amp=self.train_cfg.lambda_amp,
+                amp_weight_slope=self.train_cfg.amp_weight_slope,
+                ndvi_mean=self.train_cfg.ndvi_mean,
+                ndvi_alpha=self.train_cfg.ndvi_alpha,
+            )
+        else:  # v3
+            from ..model.vae_v2 import NdviVAEv3, NdviVAEv2Module
+            return NdviVAEv2Module(
+                vae=NdviVAEv3(**self.model_cfg),  # use_output_norm passed via model_cfg if set
+                lr=self.train_cfg.lr,
+                beta_final=self.train_cfg.beta_final,
+                beta_anneal_steps=self.train_cfg.beta_anneal_steps,
+                lambda_ssim=self.train_cfg.lambda_ssim,
+                lambda_l1=self.train_cfg.lambda_l1,
+                lambda_sobel=self.train_cfg.lambda_sobel,
+                lambda_amp=self.train_cfg.lambda_amp,
+                amp_weight_slope=self.train_cfg.amp_weight_slope,
+                ndvi_mean=self.train_cfg.ndvi_mean,
+                ndvi_alpha=self.train_cfg.ndvi_alpha,
             )
 
     # ── training ────────────────────────────────────────────────────────────────
@@ -150,22 +206,40 @@ class VaeTrainer:
         self,
         ckpt_path: str | None = None,
         init_weights: str | None = None,
+        compile_model: bool = False,
     ) -> None:
         """Run training.
 
         Args:
             ckpt_path: Resume a full Lightning checkpoint (model + optimiser state).
             init_weights: Load model weights only, starting with a fresh optimiser.
+            compile_model: Apply torch.compile (mode='reduce-overhead') for ~20-40%
+                speedup on H100. Requires Triton — skip if Triton is broken on cluster.
         """
+        # cuDNN autotuner: fixed 256×256 inputs → finds fastest conv kernel after warmup
+        torch.backends.cudnn.benchmark = True
+        # TF32 for matmul (on by default on Ampere+ but be explicit)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
         dl_train, dl_val = self.build_dataloaders()
         module = self.build_module()
 
         if init_weights:
             raw = torch.load(init_weights, map_location="cpu")
-            module.load_state_dict(raw.get("state_dict", raw), strict=True)
-            print(f"Loaded model weights from {init_weights} (fresh optimizer)")
+            sd  = raw.get("state_dict", raw)
+            missing, unexpected = module.load_state_dict(sd, strict=False)
+            if missing:
+                print(f"  Missing keys (will be randomly initialised): {missing}")
+            if unexpected:
+                print(f"  Unexpected keys (ignored): {unexpected}")
+            print(f"Loaded model weights from {init_weights} (fresh optimizer, strict=False)")
 
-        ckpt_prefix = "vae" if self.model_version == "v1" else "vae2"
+        if compile_model:
+            module.vae = torch.compile(module.vae, mode="reduce-overhead")
+            print("torch.compile enabled (mode=reduce-overhead)")
+
+        ckpt_prefix = {"v1": "vae", "v2": "vae2", "v3": "vae3"}[self.model_version]
         val_every = self.train_cfg.val_every
         steps_per_epoch = len(dl_train)
         if isinstance(val_every, float) or val_every <= steps_per_epoch:
@@ -180,6 +254,7 @@ class VaeTrainer:
             gradient_clip_val=1.0,
             accelerator="auto",
             devices="auto",
+            strategy=DDPStrategy(find_unused_parameters=False),
             precision=self.train_cfg.precision,
             callbacks=[
                 ModelCheckpoint(
@@ -192,10 +267,11 @@ class VaeTrainer:
                 LearningRateMonitor("step"),
                 EarlyStopping(
                     monitor="val/recon",
-                    patience=10,
+                    patience=self.train_cfg.early_stopping_patience,
                     mode="min",
                     min_delta=1e-4,
                     verbose=True,
+                    strict=False,      # don't crash if metric missing on resume
                 ),
             ],
         )

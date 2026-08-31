@@ -6,7 +6,7 @@ authors = [
   { name = "Riccardo D'Ercole" }
 ]
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11, <3.14"
 
 dependencies = [
     "xarray>=2025.8.0",
@@ -34,15 +34,12 @@ dependencies = [
     "pyproj",
     "majortom",
     "dask",
-    "gdal==3.12.2",
-    "modape",
     "huggingface-hub>=0.23.0",
     "eumetsearch[transform]",
 ]
 
 [tool.uv.sources]
 majortom = { git = "https://github.com/ESA-PhiLab/Major-TOM.git" }
-modape = { git = "https://github.com/WFP-VAM/modape.git" }
 eumetsearch = { path = "../eumetsearch", editable = true }
 
 

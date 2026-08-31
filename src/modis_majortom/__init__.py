@@ -1,5 +1,5 @@
 from .definitions import DATA_PATH, ROOT_DIR
-from .eo_data import EeModis, EarthAccessDownloader, MODISQCMask
+from .eo_data import EeModis, EarthAccessDownloader, MODISQCMask, MCD12Q1Downloader
 from .transform import (
     CloudMaskResult,
     generate_cloud_mask,
@@ -11,6 +11,8 @@ from .transform import (
     CloudAdapterModel,
     CloudAdapterPipeline,
     CalculationsMajorTom,
+    LandCoverTileExtractor,
+    LandCoverSource,
 )
 from .utils import (
     compute_ndvi,

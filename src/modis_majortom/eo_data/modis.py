@@ -1,7 +1,10 @@
 # import ee
 import logging
 from pathlib import Path
-from osgeo import gdal
+try:
+    from osgeo import gdal
+except ImportError:
+    gdal = None  # not required for training; only needed for data download/processing
 from pyhdf.SD import SD, SDC
 from ..definitions import DATA_PATH
 import tempfile
@@ -12,7 +15,6 @@ import os
 import re
 import glob
 import shutil
-import tempfile
 import pandas as pd
 from tqdm import tqdm
 import earthaccess
@@ -30,7 +32,6 @@ import pyproj
 from majortom import Grid
 import zarr
 import json
-import re
 import time
 import errno
 from contextlib import contextmanager
@@ -45,7 +46,16 @@ REFL_BANDS = {
 
 QC_BANDS = {"qc_500m", "qc_250m"}
 
-CLOUD_BANDS = {"state_1km", "cloud_mask"}
+CLOUD_BANDS = {"state_1km", "cloud_mask", "fparlai_qc"}
+
+LAI_FPAR_BANDS = {"lai_500m", "fpar_500m"}
+
+# MOD13A3/MOD13A2 monthly/16-day NDVI and EVI band names (lowercase, as returned by
+# pyhdf SDS name normalisation).  Scale factor 0.0001, fill value -3000.
+NDVI_MONTHLY_BANDS = {"1 km monthly ndvi", "1 km monthly evi"}
+
+# MOD13A3 DetailedQA (VI Quality) — 16-bit packed quality flags, no scaling.
+QA_MONTHLY_BANDS = {"1 km monthly vi quality"}
 
 logger = logging.getLogger(__name__)
 
@@ -310,6 +320,7 @@ class EarthAccessDownloader:
         raw_data_type=".hdf",
         add_new_variables: bool = False,
         hdf_backend: Literal["gdal", "pyhdf"] = "pyhdf",
+        version: str = None,
     ):
 
         if resolution is None:
@@ -319,6 +330,7 @@ class EarthAccessDownloader:
 
         self._add_new_variables = add_new_variables
         self._hdf_backend = hdf_backend
+        self._version = version
 
         self.date_range = self._check_dates(date_range)
 
@@ -688,6 +700,16 @@ class EarthAccessDownloader:
             if range_start <= file_date <= range_end:
                 self.files.append(f)
 
+        # Filter by collection version based on filename (e.g. ".002." for C2).
+        # earthaccess.search_data version kwarg is unreliable; filename is authoritative.
+        if self._version is not None:
+            version_tag = f".{self._version}."
+            before = len(self.files)
+            self.files = [f for f in self.files if version_tag in Path(f).name]
+            logger.info(
+                f"Version filter ({self._version}): kept {len(self.files)}/{before} files"
+            )
+
 
     def _custom_preprocess(self, da, band_name=None):
 
@@ -708,19 +730,23 @@ class EarthAccessDownloader:
         elif "VNP46A" in self.short_name:
 
             if band_name in ["NearNadir_Composite_Snow_Free", "NearNadir_Composite_Snow_Free_Std"]:
-                da = da.where(da != 65535)
-                da = da.astype("float32")
-
-                # attrs are already stripped — apply known VIIRS scale factor directly
-                # VNP46A2 radiance scale is 0.1, offset 0
-                da = da * 0.1
+                # C001: uint16 integers, fill=65535, scale_factor=0.1 → multiply by 0.1 to get nW/cm²/sr
+                # C002: float32 already in nW/cm²/sr, fill=-999.9, scale_factor=1.0 → use as-is
+                if np.issubdtype(da.dtype, np.integer):
+                    da = da.where(da != 65535)
+                    da = da.astype("float32")
+                    da = da * 0.1
+                else:
+                    # C002 fill is -999.9; mask anything < -900 to be safe
+                    da = da.astype("float32")
+                    da = da.where(da > -900.0)
 
                 da = da.rio.write_nodata(np.nan)
                 da.name = "Radiance" if "Std" not in band_name else "Radiance_Std"
 
             elif band_name in ["NearNadir_Composite_Snow_Free_Quality", "NearNadir_Composite_Snow_Free_Num"]:
-                # Categorical band → keep integer
-                da = da.where(da != 65535, 0)
+                # Both C001 and C002: fill=255, valid range 0-254
+                da = da.where(da != 255, 0)
                 da = da.astype("uint8")
                 da = da.rio.write_nodata(0)
                 da.name = "Quality_Flag"
@@ -1096,11 +1122,21 @@ class EarthAccessDownloader:
             # --- Cache subdatasets for all tiles ---
             subdatasets_cache = {}
             for f in files:
-                ds = gdal.Open(str(f))
+                try:
+                    ds = gdal.Open(str(f))
+                except RuntimeError:
+                    # gdal.UseExceptions() was called; HDF5 files raise instead of returning None
+                    ds = None
                 if ds is None:
-                    logger.warning(f"Could not open {f}, skipping.")
-                    if f.endswith(self.raw_data_type):
-                        Path(f).unlink(missing_ok=True)
+                    # GDAL may lack HDF5 driver; fall back to h5py for VIIRS tiles
+                    if str(f).endswith(".h5") and "VNP46A" in self.short_name:
+                        subdatasets_cache[f] = [
+                            (f"__H5PY__|{f}|{v}", v) for v in variables
+                        ]
+                    else:
+                        logger.warning(f"Could not open {f}, skipping.")
+                        if f.endswith(self.raw_data_type):
+                            Path(f).unlink(missing_ok=True)
                     continue
                 subdatasets_cache[f] = ds.GetSubDatasets()
 
@@ -1110,7 +1146,8 @@ class EarthAccessDownloader:
                     s[0]
                     for f in files
                     for s in subdatasets_cache.get(f, [])
-                    if var in s[0]
+                    if (s[0].startswith("__H5PY__") and s[0].endswith(f"|{var}"))
+                    or (not s[0].startswith("__H5PY__") and var in s[0])
                 ]
                 if not subdatasets:
                     logger.warning(f"No subdatasets for '{var}' on {date:%Y-%m-%d}")
@@ -1173,16 +1210,37 @@ class EarthAccessDownloader:
     # ------------------------
     # Helper: build mosaic for one variable
     # ------------------------
+    def _h5py_to_dataarray(self, h5_path: str, variable: str) -> "xr.DataArray":
+        """Read one VIIRS VNP46A HDF5 tile via h5py (used when GDAL lacks HDF5 driver)."""
+        import h5py
+        GRID = "HDFEOS/GRIDS/VIIRS_Grid_DNB_2d/Data Fields"
+        with h5py.File(h5_path, "r") as f:
+            grp = f[GRID]
+            data = grp[variable][:]
+            lat  = grp["lat"][:]
+            lon  = grp["lon"][:]
+        da = xr.DataArray(data, coords={"y": lat, "x": lon}, dims=["y", "x"])
+        da = da.rio.write_crs("EPSG:4326")
+        return da
+
     def _gdal_subdataset_to_dataarray(self, subdataset_path: str) -> "xr.DataArray":
         """
         Open a GDAL subdataset path (e.g. HDF4 EOS) directly via GDAL and return
         an xarray DataArray with CRS, transform and nodata set.
+
+        If the path starts with ``__H5PY__`` it was generated by the h5py fallback
+        in ``process_one_day`` (triggered when GDAL lacks an HDF5 driver) and is
+        dispatched to :meth:`_h5py_to_dataarray` instead.
 
         rasterio/rioxarray cannot open HDF4 EOS paths like
         HDF4_EOS:EOS_GRID:"...":Grid:Band directly, but gdal.Open() handles them
         fine.  Reading through GDAL and constructing the DataArray manually avoids
         any extra disk I/O.
         """
+        if subdataset_path.startswith("__H5PY__"):
+            # Format: __H5PY__|/path/to/file.h5|VariableName
+            _, h5_path, variable = subdataset_path.split("|", 2)
+            return self._h5py_to_dataarray(h5_path, variable)
         from affine import Affine
         from rasterio.crs import CRS as RasterioCRS
 
@@ -1291,7 +1349,7 @@ class EarthAccessDownloader:
 
             # 4. Preprocess ONCE on the full mosaic — much faster
             da_mosaic = rioxarray.open_rasterio(tif_path, chunks=True).squeeze("band", drop=True)
-            da_mosaic = self._custom_preprocess(da_mosaic, band_name=os.path.basename(str(subdatasets[0])))
+            da_mosaic = self._custom_preprocess(da_mosaic, band_name=var)
             return da_mosaic
 
         except Exception as e:
@@ -1436,7 +1494,9 @@ class EarthAccessDownloader:
     def _export_data(self, ds_date:xr.Dataset | xr.DataArray, date:str):
         """ Export daily dataset according to self._output_format """
         if self._output_format.lower() == "tiff":
-            self._export_multiband_raster(ds_date, date)
+            # VIIRS radiance data is float32 — preserve precision
+            dtype = "float32" if "VNP46A" in self.short_name else "int16"
+            self._export_multiband_raster(ds_date, date, dtype=dtype)
         else:
             raise ValueError(f"Unknown output format '{self._output_format}'")
 
@@ -1487,11 +1547,6 @@ class EarthAccessDownloader:
         """
         Transform bounding box to dataset CRS and clip the dataset.
         """
-        if isinstance(ds, xr.DataArray):
-            ds_repr = ds.to_dataset(name=ds.name)
-        else:
-            ds_repr = ds
-
         project = pyproj.Transformer.from_crs("EPSG:4326", dst_crs, always_xy=True).transform
         minx, miny = project(bbox_deg[0], bbox_deg[1])
         maxx, maxy = project(bbox_deg[2], bbox_deg[3])
@@ -1570,7 +1625,7 @@ class EarthAccessDownloader:
         if self._store_cloud:
             # For cloud storage, we need to check existence differently
             try:
-                ds_existing = xr.open_zarr(zarr_path)
+                xr.open_zarr(zarr_path)  # existence probe; raises if the store isn't there
                 if self._add_new_variables:
                     # Add new variable arrays without touching existing time steps
                     ds.to_zarr(zarr_path, mode="a")
@@ -1678,7 +1733,7 @@ class EarthAccessDownloader:
         list of tuples
             List of (batch_start, batch_end) date ranges
         """
-        from datetime import datetime, timedelta
+        from datetime import timedelta
 
         start = pd.to_datetime(start_date)
         end = pd.to_datetime(end_date)
@@ -1900,12 +1955,39 @@ class EarthAccessDownloader:
             offset = band.GetOffset() or 0.0
             data = data * scale + offset
 
+        elif band_name in LAI_FPAR_BANDS:
+            data = data.astype(np.float32)
+            nodata = band.GetNoDataValue()
+            if nodata is not None:
+                data[data == nodata] = np.nan
+            # Valid raw range is 0-100 for both Lai_500m and Fpar_500m; raw
+            # 249-254 are non-vegetated/special QC codes, 255 is fill. Mask
+            # on the raw value (scale-independent) before applying scale_factor.
+            data[data > 100] = np.nan
+            scale = band.GetScale() or 1.0
+            offset = band.GetOffset() or 0.0
+            data = (data * scale + offset).astype(np.float16)
+
         elif band_name in QC_BANDS:
             data = data.astype(np.uint16)
             data = MODISQCMask.get_mask(data, band_name)
 
         elif band_name in CLOUD_BANDS:
             data = data.astype(np.uint16)  # store raw QA bits; decode at load time
+
+        elif band_name in NDVI_MONTHLY_BANDS:
+            data = data.astype(np.float32)
+            nodata = band.GetNoDataValue()
+            if nodata is not None:
+                data[data == nodata] = np.nan
+            data[data == -3000] = np.nan   # MOD13 canonical fill
+            data[data < -2000] = np.nan    # out-of-range guard
+            # MOD13A3 NDVI: raw int16 in [-2000, 10000], scale=0.0001.
+            # GetScale() may return the reciprocal (10000) or None; hardcode.
+            data = (data * np.float32(0.0001)).astype(np.float16)
+
+        elif band_name in QA_MONTHLY_BANDS:
+            data = data.astype(np.uint16)  # raw 16-bit VI Quality flags; decode at load time
 
         return data, band_name
 
@@ -2281,11 +2363,37 @@ class EarthAccessDownloader:
                             scale = float(attrs.get('scale_factor') or 1.0)
                             offset = float(attrs.get('add_offset') or 0.0)
                             data = data * scale + offset
+                        elif band_name in LAI_FPAR_BANDS:
+                            data = data.astype(np.float32)
+                            fill_value = attrs.get('_FillValue')
+                            if fill_value is not None:
+                                data[data == fill_value] = np.nan
+                            # Valid raw range is 0-100 for both Lai_500m and Fpar_500m; raw
+                            # 249-254 are non-vegetated/special QC codes, 255 is fill. Mask
+                            # on the raw value (scale-independent) before applying scale_factor.
+                            data[data > 100] = np.nan
+                            scale = float(attrs.get('scale_factor') or 1.0)
+                            offset = float(attrs.get('add_offset') or 0.0)
+                            data = (data * scale + offset).astype(np.float16)
                         elif band_name in QC_BANDS:
                             data = data.astype(np.uint16)
                             data = MODISQCMask.get_mask(data, band_name)
                         elif band_name in CLOUD_BANDS:
                             data = data.astype(np.uint16)
+
+                        elif band_name in NDVI_MONTHLY_BANDS:
+                            data = data.astype(np.float32)
+                            fill_value = attrs.get('_FillValue')
+                            if fill_value is not None:
+                                data[data == fill_value] = np.nan
+                            data[data == -3000] = np.nan
+                            data[data < -2000] = np.nan
+                            # MOD13A3 NDVI: raw int16 in [-2000, 10000], scale=0.0001.
+                            # attrs scale_factor may be reciprocal or absent; hardcode.
+                            data = (data * np.float32(0.0001)).astype(np.float16)
+
+                        elif band_name in QA_MONTHLY_BANDS:
+                            data = data.astype(np.uint16)  # raw 16-bit VI Quality flags
 
                         ny, nx = data.shape
                         band_data[var] = data
@@ -2293,8 +2401,8 @@ class EarthAccessDownloader:
 
                     hdf_sd.end()
 
-                # Safety: ensure reference band is reflectance (used to gate writes)
-                if band_types.get(reference_band) not in REFL_BANDS:
+                # Safety: ensure reference band is a known band type (used to gate writes)
+                if band_types.get(reference_band) not in REFL_BANDS | NDVI_MONTHLY_BANDS | QA_MONTHLY_BANDS:
                     logger.warning(
                         f"Reference band {reference_band} is not reflectance: {band_types.get(reference_band)}"
                     )
@@ -2360,6 +2468,9 @@ class EarthAccessDownloader:
                         if band_name in REFL_BANDS:
                             dtype = "float16"
                             patch = np.ascontiguousarray(patch, dtype=np.float16)
+                        elif band_name in LAI_FPAR_BANDS:
+                            dtype = "float16"
+                            patch = np.ascontiguousarray(patch, dtype=np.float16)
                         elif band_name in QC_BANDS:
                             # decoded QC mask stored as uint8 (boolean)
                             patch = np.ascontiguousarray(patch.astype(np.uint8))
@@ -2367,6 +2478,17 @@ class EarthAccessDownloader:
                         elif band_name in CLOUD_BANDS:
                             # raw QA bits stored as uint16 for load-time decoding
                             patch = np.ascontiguousarray(patch.astype(np.uint16))
+                            dtype = "uint16"
+                        elif band_name in NDVI_MONTHLY_BANDS:
+                            dtype = "float16"
+                            patch = np.ascontiguousarray(patch, dtype=np.float16)
+                        elif band_name in QA_MONTHLY_BANDS:
+                            # Re-slice from the original uint16 array to avoid the lossy
+                            # float16 intermediate applied above (uint16 → float16 loses bits).
+                            orig = band_data.get(var)
+                            patch = np.ascontiguousarray(
+                                orig[row - HALF : row + HALF, col - HALF : col + HALF].astype(np.uint16)
+                            )
                             dtype = "uint16"
                         else:
                             # Unsupported band type for writing
@@ -2424,7 +2546,6 @@ class EarthAccessDownloader:
         # Return the set of dates that received at least one successful write
         return set(written_counts.keys())
 
-import numpy as np
 
 
 class MODISQCMask:
@@ -2503,7 +2624,7 @@ class MODISQCMask:
     # -----------------------------
     def state_1km_cloud_mask(
         QA: np.ndarray,
-        algorithm: Literal["strict", "internal", "cloud_state", "binned"] = "strict"
+        algorithm: Literal["strict", "internal", "cloud_state", "cloud_only", "binned"] = "strict"
         ) -> np.ndarray:
 
         cloud_state = MODISQCMask._bits(QA, 0, 2)
@@ -2522,6 +2643,13 @@ class MODISQCMask:
             )
         elif algorithm == "cloud_state":
             return (cloud_state == 1) | (cloud_state == 2)
+
+        elif algorithm == "cloud_only":
+            # Only flag definite cloud (bits 0-1 == 01).
+            # Mixed pixels (bits 0-1 == 10) are treated as potentially clear so
+            # the Whittaker asymmetric smoother can use their NDVI signal and
+            # suppress cloud dips via residual detection rather than zeroing them.
+            return cloud_state == 1
 
         elif algorithm == "binned":
             return (cloud_state == 2) | (cloud_state == 3)
@@ -2706,10 +2834,13 @@ def apply_modis_qa_mask(
 
         raise ValueError(f"Unsupported MODIS QA band: {band_name}")
 
-"""
-This function has not been tested yet
-"""
 class StacModisTileProcessor:
+    """STAC-based MODIS tile pipeline (scaffolding, not yet finished).
+
+    load_data() needs an odc-stac (or equivalent) `load()` call — odc-stac
+    isn't a project dependency yet, so this raises NotImplementedError there.
+    """
+
     def __init__(self,
                  stac_url,
                  collection,
@@ -2741,15 +2872,10 @@ class StacModisTileProcessor:
         if not items:
             raise ValueError("No items found for the given search parameters.")
 
-        self.ds = load(
-            items,
-            bands=self.bands,
-            crs=self.crs,
-            resolution=self.resolution,
-            groupby="solar_day",
-            chunks={"time": 5, "x": 1024, "y": 1024},
+        raise NotImplementedError(
+            "StacModisTileProcessor.load_data needs an odc-stac `load()` call "
+            "(odc-stac is not yet a project dependency)."
         )
-        logger.info(f"Loaded dataset: {self.ds}")
 
     def process_tiles(self):
         if self.ds is None:

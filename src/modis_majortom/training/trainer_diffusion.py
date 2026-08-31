@@ -1,8 +1,7 @@
 """DiffusionTrainer — encapsulates the EDMDiffusion training loop."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Any
 
 import datetime
@@ -47,6 +46,8 @@ class DiffusionDataConfig:
     max_fci_nan_fraction: float = 1.0
     whittaker_target: bool = False
     max_lap_var: float = 0.0          # Laplacian-variance threshold; 0.0 = disabled
+    start_date: str | None = None     # ISO date; restrict FCI dates to >= this value
+    use_whittaker_cloud_mask: bool = False  # exclude ±7d gap pixels from loss
     ndvi_oversample: float = 0.0      # expand train set by this factor; 0 = disabled
     ndvi_oversample_mode: str = "mean"  # "mean" | "frac_above"
     ndvi_oversample_threshold: float = 0.5  # pixel threshold for "frac_above" mode
@@ -214,6 +215,7 @@ class DiffusionTrainer:
             modis_src = MODISSource(
                 raw_zarr_path=self.data_cfg.modis_raw_zarr,
                 processed_zarr_path=self.data_cfg.modis_proc_zarr,
+                use_gap_mask=self.data_cfg.use_whittaker_cloud_mask,
             )
         else:
             modis_src = RawGAMODISSource(raw_zarr_path=self.data_cfg.modis_raw_zarr)
@@ -247,10 +249,18 @@ class DiffusionTrainer:
             if self.data_cfg.lai_zarr else None
         )
 
+        fci_dates: list[str] | None = None
+        if self.data_cfg.start_date:
+            fci_store_tmp = zarr.open(str(self.data_cfg.fci_zarr), mode="r")
+            all_fci_dates = sorted(set(k[:10] for k in fci_store_tmp["patches"]["vis_06"].keys()))
+            fci_dates = [d for d in all_fci_dates if d >= self.data_cfg.start_date]
+            log.info("start_date=%s → %d FCI dates retained", self.data_cfg.start_date, len(fci_dates))
+
         samples = build_sample_index(
             fci_store_path=self.data_cfg.fci_zarr,
             ancillary_sources=ancillary,
             max_fci_nan_fraction=self.data_cfg.max_fci_nan_fraction,
+            dates=fci_dates,
         )
         if self.data_cfg.max_lap_var > 0.0 and self.data_cfg.modis_proc_zarr:
             samples = _filter_noisy_patches(

@@ -123,10 +123,14 @@ class MODISSource(AncillarySource):
         self,
         raw_zarr_path: Union[str, Path],
         processed_zarr_path: Union[str, Path],
+        use_gap_mask: bool = False,
+        gap_threshold_days: float = 7.0,
     ) -> None:
-        self._raw_path       = str(raw_zarr_path)
-        self._processed_path = str(processed_zarr_path)
-        self._local          = threading.local()
+        self._raw_path          = str(raw_zarr_path)
+        self._processed_path    = str(processed_zarr_path)
+        self._use_gap_mask      = use_gap_mask
+        self._gap_threshold     = gap_threshold_days
+        self._local             = threading.local()
 
     @property
     def _raw_store(self):
@@ -153,7 +157,20 @@ class MODISSource(AncillarySource):
         # Upsample 2× so all bands share the 512×512 GQ coordinate frame expected by reproject().
         ndvi_whi = upsample_500_to_250(proc["ndvi_envelope"][date][grid_id][:].astype(np.float32))
         soft     = upsample_500_to_250(proc["soft_score"][date][grid_id][:].astype(np.float32))
-        return {"ndvi_observed": ndvi_obs, "ndvi_whittaker": ndvi_whi, "soft_score": soft}
+        bands = {"ndvi_observed": ndvi_obs, "ndvi_whittaker": ndvi_whi, "soft_score": soft}
+
+        if self._use_gap_mask:
+            try:
+                fwd = proc["forward_gap"][date][grid_id][:].astype(np.float32)
+                bwd = proc["backward_gap"][date][grid_id][:].astype(np.float32)
+                # 1 = reliable (clear obs within ±gap_threshold days), 0 = both gaps exceed threshold
+                # inf values (no obs in that direction) satisfy >= threshold → masked out correctly
+                gap_mask = (~((fwd >= self._gap_threshold) & (bwd >= self._gap_threshold))).astype(np.float32)
+            except KeyError:
+                gap_mask = np.ones((ndvi_whi.shape[0] // 2, ndvi_whi.shape[1] // 2), dtype=np.float32)
+            bands["gap_cloud_mask"] = upsample_500_to_250(gap_mask)
+
+        return bands
 
     def patch_origin(self, lat: float, lon: float) -> tuple[int, int]:
         return modis_patch_corner_for_cell(lat, lon, patch_px=self.PATCH_PX)
@@ -287,7 +304,7 @@ class MOD13A3Source:
     @property
     def _store(self):
         if not hasattr(self._local, "store"):
-            self._local.store = zarr.open(self._path, mode="r", use_consolidated=False)
+            self._local.store = zarr.open(self._path, mode="r", zarr_format=2)
         return self._local.store
 
     @staticmethod
@@ -751,9 +768,10 @@ class AlignedPatchDataset(Dataset):
             warnings.simplefilter("ignore")
             aligned = modis_src.reproject(modis_bands, mod_r0, mod_c0, target_grid)
 
-        ndvi_obs = aligned["ndvi_observed"]   # (H, W) float32
-        ndvi_whi = aligned["ndvi_whittaker"]  # (H, W) float32
-        soft     = aligned["soft_score"]      # (H, W) float32
+        ndvi_obs      = aligned["ndvi_observed"]   # (H, W) float32
+        ndvi_whi      = aligned["ndvi_whittaker"]  # (H, W) float32
+        soft          = aligned["soft_score"]      # (H, W) float32
+        gap_cloud_mask = aligned.get("gap_cloud_mask")  # (H, W) float32 | None
 
         # Clamp soft_score to [0, 1]; treat NaN as fully uncertain (0)
         soft = np.clip(np.nan_to_num(soft, nan=0.0), 0.0, 1.0)
@@ -796,6 +814,8 @@ class AlignedPatchDataset(Dataset):
             "cell_lat":    lat,
             "cell_lon":    lon,
         }
+        if gap_cloud_mask is not None:
+            sample["whittaker_cloud_mask"] = _to_tensor(gap_cloud_mask)
 
         # ERA5 ancillary — optional; shape (N_vars, n_days, H, W)
         era5_src = self.ancillary_sources.get("era5")

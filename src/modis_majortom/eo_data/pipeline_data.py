@@ -1,14 +1,13 @@
 from .modis import EarthAccessDownloader
-from ..utils import generate_bboxes_fixed, init_logging, tile_has_min_land_fraction, plot_boxes_on_map, generate_bboxes_from_resolution
+from ..utils import generate_bboxes_fixed, init_logging, tile_has_min_land_fraction, plot_boxes_on_map
 # from osgeo import gdal
-from ..definitions import ROOT_DIR, DATA_PATH
+from ..definitions import DATA_PATH
 from pathlib import Path
 from dotenv import load_dotenv
 import argparse
 import os
 import shutil
 import traceback
-from ..utils import init_logging
 import sys
 from tqdm import tqdm
 import numpy as np
@@ -114,6 +113,45 @@ products = {
                           "QF_Cloud_Mask"
             ],
             "raw_data_type" : "h5"
+        },
+
+        "land_cover": {
+            "short_name": "MCD12Q1",
+            "variables": ["LC_Type1",
+                          "LC_Type2",
+                          "QC"
+            ],
+            "raw_data_type": "hdf",
+            "crs": "EPSG:6933",
+            "resolution": 500,
+            "patch_size": 128
+        },
+
+        # LAI/FPAR 4-day composite. Registered here for reference; the June eu_africa
+        # download matching MOD09GA_dataset.zarr's bboxes is done via
+        # scripts/download_MCD15A3H.py.
+        "LAI": {
+            "short_name": "MCD15A3H",
+            "variables": ["Lai_500m",
+                          "Fpar_500m",
+                          "FparLai_QC"
+            ],
+            "raw_data_type": "hdf",
+            "crs": "EPSG:6933",
+            "resolution": 500,
+            "patch_size": 128
+        },
+
+        # GPWv4 is not MODIS — use scripts/download_GPWv4_latin_america.py directly.
+        # Registered here for reference; pipeline_data.py does not process it.
+        "gpw_population": {
+            "short_name": "CIESIN_SEDAC_GPWv4_POPCOUNT_R11",
+            "variables": ["population_count"],
+            "raw_data_type": "tif",
+            "crs": "EPSG:4326",
+            "resolution": 30,        # arc-seconds (~1 km)
+            "temporal": "quinquennial",
+            "years": [2000, 2005, 2010, 2015, 2020]
         }
     }
 

@@ -2,6 +2,10 @@
 
 A Python package for downloading, processing, and archiving MODIS satellite data with cloud masking capabilities and MajorTom grid integration. Handles data acquisition from NASA Earthdata, applies advanced cloud detection algorithms, performs reprojection, and exports data in Zarr or GeoTIFF format.
 
+This README covers the data acquisition/processing package. For the NDVI latent diffusion model
+built on top of this data (architecture, model version lineage, and how to reproduce a training
+run), see [`docs/DIFFUSION_MODEL.md`](docs/DIFFUSION_MODEL.md).
+
 ## Features
 
 - Download MODIS/VIIRS products via NASA Earthdata (`earthaccess`)

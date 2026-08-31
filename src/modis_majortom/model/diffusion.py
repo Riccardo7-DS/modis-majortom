@@ -10,7 +10,6 @@ from __future__ import annotations
 from pathlib import Path
 
 import torch
-import torch.nn as nn
 import pytorch_lightning as pl
 import yaml
 
@@ -140,6 +139,15 @@ class EDMDiffusion(pl.LightningModule):
         Multiplier on the FAPAR term relative to LAI within the combined
         auxiliary loss ("lambda_fapar"); tune if one task dominates training.
         Only used when add_lai=True.
+    lai_norm_scale :
+        Fixed physical normalisation divisor applied to LAI (prediction and
+        target) before the squared-error term is computed, so its loss
+        magnitude is on the same order as FAPAR's (already native [0,1])
+        instead of ~15-20x larger — MCD15A3H ``Lai_500m``'s valid range is
+        0-10 m^2/m^2 per the product spec, so dividing by 10 puts both
+        variables on a comparable ~[0,1] scale. This removes scale as a
+        confound from ``fapar_loss_weight``, which then only expresses
+        genuine task-priority preference. Only used when add_lai=True.
     """
 
     def __init__(
@@ -170,6 +178,7 @@ class EDMDiffusion(pl.LightningModule):
         lai_query_size: int = 32,
         lai_loss_weight: float = 1.0,
         fapar_loss_weight: float = 1.0,
+        lai_norm_scale: float = 10.0,
         use_soft_mask: bool = True,
         vae_use_output_norm: bool = True,
     ):
@@ -248,6 +257,7 @@ class EDMDiffusion(pl.LightningModule):
         self.add_lai = add_lai
         self.lai_loss_weight = lai_loss_weight
         self.fapar_loss_weight = fapar_loss_weight
+        self.lai_norm_scale = lai_norm_scale
         self.use_soft_mask = use_soft_mask
         self.lai_head = (
             LAIHead(context_dim=context_dim, channels=lai_head_channels,
@@ -354,6 +364,23 @@ class EDMDiffusion(pl.LightningModule):
         soft_lat = torch.nn.functional.avg_pool2d(soft, kernel_size=pool_k, stride=pool_k)
         return (soft_lat - 0.2).clamp(min=0) / 0.8                            # remap [0.2,1]→[0,1]
 
+    def _gap_mask(self, batch: dict, latent: torch.Tensor) -> torch.Tensor:
+        """Downsample the ±7d Whittaker cloud mask to latent space.
+
+        Returns a (B, 1, H_lat, W_lat) float tensor: 1 = reliable pixel
+        (clear observation exists within ±7 days), 0 = both gaps exceed 7 days.
+        Falls back to all-ones (no masking) when the key is absent, preserving
+        backward compatibility with datasets built without use_gap_mask=True.
+        """
+        if "whittaker_cloud_mask" not in batch:
+            return torch.ones(latent.shape[0], 1, latent.shape[2], latent.shape[3],
+                              device=latent.device, dtype=latent.dtype)
+        mask   = batch["whittaker_cloud_mask"].to(latent.device)   # (B, 1, 256, 256)
+        pool_k = mask.shape[-1] // latent.shape[-1]
+        if pool_k > 1:
+            mask = torch.nn.functional.avg_pool2d(mask, kernel_size=pool_k, stride=pool_k)
+        return mask
+
     def _lai_loss(self, batch: dict, ctx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Masked MSE for the joint LAI+FAPAR head, computed independently per variable.
 
@@ -365,6 +392,13 @@ class EDMDiffusion(pl.LightningModule):
         and each is normalised by its own ``mask.sum()`` rather than the full
         batch size, keeping loss magnitude comparable across batches with
         different numbers of composite-date samples (~1-in-4 on average).
+
+        LAI (prediction and target) is additionally divided by
+        ``lai_norm_scale`` before squaring, so ``loss_lai`` and ``loss_fapar``
+        land on comparable magnitudes by construction — raw LAI has ~15-20x
+        the variance of FAPAR (physical units 0-10 vs a native [0,1]
+        fraction), so without this the combined aux loss is dominated by LAI
+        regardless of ``fapar_loss_weight``.
 
         Reuses ``ctx`` from the caller's ``_condition()`` call, including
         whatever CFG dropout was applied for the NDVI branch — a mild, cheap
@@ -384,9 +418,10 @@ class EDMDiffusion(pl.LightningModule):
             )
         pred = self.lai_head(ctx, batch["target_lai"].shape[0])  # (B, 2, H, W)
 
-        target_lai = batch["target_lai"].to(ctx.device)
+        target_lai = batch["target_lai"].to(ctx.device) / self.lai_norm_scale
+        pred_lai   = pred[:, 0:1] / self.lai_norm_scale
         mask_lai   = batch["lai_mask"].to(ctx.device)
-        se_lai     = mask_lai * (pred[:, 0:1] - target_lai).pow(2)
+        se_lai     = mask_lai * (pred_lai - target_lai).pow(2)
         loss_lai   = se_lai.sum() / mask_lai.sum().clamp(min=1.0)
 
         target_fapar = batch["target_fpar"].to(ctx.device)
@@ -412,7 +447,8 @@ class EDMDiffusion(pl.LightningModule):
         D_theta   = self._denoiser(z_noisy, sigma, ctx, lc_tensor, era5_feat, mtg_spatial, ndvi_bg)
         w         = self.schedule.loss_weight(sigma)[:, None, None, None].clamp(max=1e4)
         soft_mask = self._soft_mask(batch, z)
-        ndvi_loss = (w * soft_mask * (D_theta - z).pow(2)).mean()
+        gap_mask  = self._gap_mask(batch, z)
+        ndvi_loss = (w * soft_mask * gap_mask * (D_theta - z).pow(2)).mean()
         ndvi_loss = torch.nan_to_num(ndvi_loss, nan=0.0, posinf=0.0)
         loss      = ndvi_loss
 
@@ -439,7 +475,8 @@ class EDMDiffusion(pl.LightningModule):
         D_theta   = self._denoiser(z_noisy, sigma, ctx, lc_tensor, era5_feat, mtg_spatial, ndvi_bg)
         w         = self.schedule.loss_weight(sigma)[:, None, None, None].clamp(max=1e4)
         soft_mask = self._soft_mask(batch, z)
-        ndvi_loss = (w * soft_mask * (D_theta - z).pow(2)).mean()
+        gap_mask  = self._gap_mask(batch, z)
+        ndvi_loss = (w * soft_mask * gap_mask * (D_theta - z).pow(2)).mean()
         ndvi_loss = torch.nan_to_num(ndvi_loss, nan=0.0, posinf=0.0)
         loss      = ndvi_loss
 

@@ -570,6 +570,44 @@ class MTGMODISDataset:
 
         return np.stack(band_composites, axis=0)  # (C, H, W)
 
+    def compute_mtg_ndvi_composite(self, grid_id: str, date: str) -> np.ndarray:
+        """
+        Daily max-NDVI composite for one grid cell and date.
+
+        For each intra-day MTG timestamp:
+          1. Load vis_06 (red) and vis_08 (NIR) patches.
+          2. Compute per-pixel NDVI = (NIR - RED) / (NIR + RED).
+             Pixels where NIR + RED < 0.01 (near-zero denominator) are masked as NaN.
+          3. Take the pixel-wise maximum across all timestamps.
+
+        Returns ``(H, W)`` float32 with NaN where no valid observation exists.
+        """
+        vis06_grp = self._mtg_store["patches"]["vis_06"]
+        vis08_grp = self._mtg_store["patches"]["vis_08"]
+
+        entries06 = self._mtg_lookup.get("vis_06", {}).get(date, {}).get(grid_id, [])
+        entries08 = self._mtg_lookup.get("vis_08", {}).get(date, {}).get(grid_id, [])
+
+        # Build a common set of timestamps available in both bands
+        ts06 = {ts: idx for ts, idx in entries06}
+        ts08 = {ts: idx for ts, idx in entries08}
+        common_ts = sorted(set(ts06) & set(ts08))
+
+        if not common_ts:
+            return np.full((128, 128), np.nan, dtype=np.float32)
+
+        ndvi_frames: list[np.ndarray] = []
+        for ts in common_ts:
+            red = vis06_grp[ts]["data"][ts06[ts]].astype(np.float32)
+            nir = vis08_grp[ts]["data"][ts08[ts]].astype(np.float32)
+            denom = nir + red
+            with np.errstate(invalid="ignore", divide="ignore"):
+                ndvi = np.where(denom > 0.01, (nir - red) / denom, np.nan).astype(np.float32)
+            ndvi_frames.append(ndvi)
+
+        with np.errstate(all="ignore"):
+            return np.nanmax(np.stack(ndvi_frames, axis=0), axis=0)
+
     def _load_modis(self, grid_id: str, date: str) -> dict[str, np.ndarray]:
         """
         Load all requested MOD09GQ variables for ``grid_id`` on ``date``.

@@ -19,3 +19,4 @@ from .cloud_adapter import (
 from .majortom import CalculationsMajorTom
 from .ndvi_whittaker import WhittakerPipeline, CloudDetectionResult
 from .tile_extraction import TileDescriptor, extract_clean_tiles
+from .land_cover import LandCoverTileExtractor, LandCoverSource

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import logging
+
 import torch
 from pytorch_lightning.callbacks import Callback
+
+log = logging.getLogger(__name__)
 
 
 class EMACallback(Callback):
@@ -24,17 +28,25 @@ class EMACallback(Callback):
     def on_train_start(self, trainer, pl_module) -> None:
         dev = next(pl_module.parameters()).device
         if not self.shadow:
+            log.warning("EMACallback: no shadow found — initialising EMA from current model weights.")
             for name, param in pl_module.named_parameters():
                 if param.requires_grad:
-                    self.shadow[name] = param.data.detach().clone()
+                    self.shadow[name] = param.data.detach().clone().to(dev)
         else:
-            # on_load_checkpoint fires before the model is on GPU; move shadows now
+            # on_load_checkpoint stores on CPU; move to training device now
+            log.info("EMACallback: moving %d shadow tensors to %s.", len(self.shadow), dev)
             self.shadow = {k: v.to(dev) for k, v in self.shadow.items()}
 
     def on_load_checkpoint(self, trainer, pl_module, checkpoint) -> None:
         if "ema_shadow" in checkpoint:
-            dev = next(pl_module.parameters()).device
-            self.shadow = {k: v.to(dev) for k, v in checkpoint["ema_shadow"].items()}
+            # Store on CPU — on_train_start moves shadows to the training device.
+            # Avoid calling pl_module.parameters() here: pl_module may be None
+            # in Lightning 2.x when on_load_checkpoint fires before the module
+            # is fully attached to the trainer.
+            self.shadow = {k: v.cpu() for k, v in checkpoint["ema_shadow"].items()}
+            log.info("EMACallback: loaded %d shadow tensors from checkpoint.", len(self.shadow))
+        else:
+            log.warning("EMACallback: checkpoint has no 'ema_shadow' — EMA will reinitialise from raw weights.")
 
     def on_save_checkpoint(self, trainer, pl_module, checkpoint) -> None:
         checkpoint["ema_shadow"] = {k: v.cpu() for k, v in self.shadow.items()}
