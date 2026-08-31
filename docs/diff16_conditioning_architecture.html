@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>diff16 Conditioning Architecture</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:       #0f1923;
+    --bg2:      #162030;
+    --border:   #1e2e40;
+    --text:     #e8e4dd;
+    --muted:    #7a8899;
+    --era5:     #5b9bd5;
+    --era5-dim: #1e3a56;
+    --mtg:      #d4a047;
+    --mtg-dim:  #3d2a0a;
+    --spatial:  #7aab7a;
+    --spatial-dim: #1a3020;
+    --rose:     #c07a8a;
+    --rose-dim: #3a1520;
+    --cat:      #a57de8;
+    --cat-dim:  #2a1850;
+    --mono: ui-monospace, 'Cascadia Code', 'JetBrains Mono', monospace;
+    --sans: system-ui, -apple-system, sans-serif;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    min-height: 100vh;
+    padding: 2rem;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 1.5rem;
+  }
+
+  h1 {
+    font-size: 1.1rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    color: var(--text);
+    text-align: center;
+  }
+
+  .subtitle {
+    font-size: 0.75rem;
+    color: var(--muted);
+    text-align: center;
+    font-family: var(--mono);
+    letter-spacing: 0.03em;
+  }
+
+  .legend {
+    display: flex;
+    gap: 1.5rem;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.72rem;
+    color: var(--muted);
+  }
+
+  .legend-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .diagram-wrap {
+    width: 100%;
+    max-width: 1100px;
+    overflow-x: auto;
+  }
+
+  svg {
+    display: block;
+    margin: 0 auto;
+  }
+
+  .lbl-title {
+    font-family: var(--sans);
+    font-size: 11px;
+    font-weight: 600;
+    fill: var(--text);
+  }
+  .lbl-shape {
+    font-family: var(--mono);
+    font-size: 9.5px;
+    fill: var(--muted);
+  }
+  .lbl-section {
+    font-family: var(--sans);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .arrow {
+    fill: none;
+    stroke-width: 1.5;
+    marker-end: url(#arr);
+  }
+  .arr-era5  { stroke: var(--era5); }
+  .arr-mtg   { stroke: var(--mtg); }
+  .arr-spa   { stroke: var(--spatial); }
+  .arr-cat   { stroke: var(--cat); }
+  .arr-rose  { stroke: var(--rose); }
+  .arr-muted { stroke: var(--muted); stroke-dasharray: 4 3; }
+</style>
+</head>
+<body>
+
+<div style="max-width:1100px;margin:0 auto;">
+  <h1>diff16 — Conditioning Architecture</h1>
+  <p class="subtitle">EDMDiffusion · latent_dim=32 · context_dim=512 · ndvi_bg_channels=16</p>
+
+  <div style="height:1rem;"></div>
+
+  <div class="legend">
+    <div class="legend-item"><div class="legend-dot" style="background:var(--era5)"></div> ERA5 (cross-attn)</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--mtg)"></div> MTG FCI (cross-attn)</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--spatial)"></div> MTG spatial (FiLM)</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--cat)"></div> channel-concat</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--rose)"></div> VAE latent</div>
+    <div class="legend-item"><div class="legend-dot" style="background:var(--muted)"></div> decoder (inference only)</div>
+  </div>
+
+  <div style="height:1.5rem;"></div>
+
+  <div class="diagram-wrap">
+    <svg width="1060" height="640" viewBox="0 0 1060 640" xmlns="http://www.w3.org/2000/svg">
+      <defs>
+        <marker id="arr-era5"  markerWidth="7" markerHeight="7" refX="5" refY="3.5" orient="auto"><polygon points="0 0,7 3.5,0 7" fill="#5b9bd5"/></marker>
+        <marker id="arr-mtg"   markerWidth="7" markerHeight="7" refX="5" refY="3.5" orient="auto"><polygon points="0 0,7 3.5,0 7" fill="#d4a047"/></marker>
+        <marker id="arr-spa"   markerWidth="7" markerHeight="7" refX="5" refY="3.5" orient="auto"><polygon points="0 0,7 3.5,0 7" fill="#7aab7a"/></marker>
+        <marker id="arr-cat"   markerWidth="7" markerHeight="7" refX="5" refY="3.5" orient="auto"><polygon points="0 0,7 3.5,0 7" fill="#a57de8"/></marker>
+        <marker id="arr-rose"  markerWidth="7" markerHeight="7" refX="5" refY="3.5" orient="auto"><polygon points="0 0,7 3.5,0 7" fill="#c07a8a"/></marker>
+        <marker id="arr-muted" markerWidth="7" markerHeight="7" refX="5" refY="3.5" orient="auto"><polygon points="0 0,7 3.5,0 7" fill="#7a8899"/></marker>
+      </defs>
+
+      <!-- background bands -->
+      <rect x="0" y="0" width="300" height="640" fill="#0d1620" rx="0"/>
+      <rect x="300" y="0" width="220" height="640" fill="#0f1923" rx="0"/>
+      <rect x="520" y="0" width="280" height="640" fill="#0d1620" rx="0"/>
+      <rect x="800" y="0" width="260" height="640" fill="#0f1923" rx="0"/>
+
+      <!-- column labels -->
+      <text x="150" y="22" text-anchor="middle" class="lbl-section" fill="#3a4f68">Inputs</text>
+      <text x="410" y="22" text-anchor="middle" class="lbl-section" fill="#3a4f68">Encoders</text>
+      <text x="660" y="22" text-anchor="middle" class="lbl-section" fill="#3a4f68">UNet Denoiser</text>
+      <text x="930" y="22" text-anchor="middle" class="lbl-section" fill="#3a4f68">VAE</text>
+
+      <!-- ERA5 -->
+      <rect x="12" y="42" width="160" height="52" fill="#1e3a56" stroke="#5b9bd5" stroke-width="1.2" rx="6"/>
+      <text x="22" y="60" class="lbl-title" fill="#5b9bd5">ERA5</text>
+      <text x="22" y="75" class="lbl-shape">(B, 12, 15, H, W)</text>
+      <text x="22" y="87" class="lbl-shape">12 vars · 15 days</text>
+
+      <!-- MTG FCI -->
+      <rect x="12" y="140" width="160" height="52" fill="#3d2a0a" stroke="#d4a047" stroke-width="1.2" rx="6"/>
+      <text x="22" y="158" class="lbl-title" fill="#d4a047">MTG FCI</text>
+      <text x="22" y="173" class="lbl-shape">(B, 18, H, W)</text>
+      <text x="22" y="185" class="lbl-shape">15 raw + 3 composite</text>
+
+      <!-- Land Cover -->
+      <rect x="12" y="340" width="160" height="52" fill="#2a1850" stroke="#a57de8" stroke-width="1.2" rx="6"/>
+      <text x="22" y="358" class="lbl-title" fill="#a57de8">Land Cover</text>
+      <text x="22" y="373" class="lbl-shape">(B, 1, H, W)</text>
+      <text x="22" y="385" class="lbl-shape">MCD12Q1 IGBP · 18 cls</text>
+
+      <!-- MOD13A3 -->
+      <rect x="12" y="450" width="160" height="52" fill="#1a3020" stroke="#7aab7a" stroke-width="1.2" rx="6"/>
+      <text x="22" y="468" class="lbl-title" fill="#7aab7a">MOD13A3</text>
+      <text x="22" y="483" class="lbl-shape">(B, 1, 128, 128)</text>
+      <text x="22" y="495" class="lbl-shape">prev-month NDVI</text>
+
+      <!-- NDVI target -->
+      <rect x="12" y="560" width="160" height="52" fill="#3a1520" stroke="#c07a8a" stroke-width="1.2" rx="6"/>
+      <text x="22" y="578" class="lbl-title" fill="#c07a8a">NDVI target</text>
+      <text x="22" y="593" class="lbl-shape">(B, 1, 256, 256)</text>
+      <text x="22" y="605" class="lbl-shape">training only</text>
+
+      <!-- ERA5TokenEncoder -->
+      <rect x="310" y="42" width="190" height="52" fill="#1e3a56" stroke="#5b9bd5" stroke-width="1.2" rx="6"/>
+      <text x="320" y="58" class="lbl-title" fill="#5b9bd5">ERA5TokenEncoder</text>
+      <text x="320" y="73" class="lbl-shape">→ (B, 15, 512)</text>
+      <text x="320" y="85" class="lbl-shape">15 temporal tokens</text>
+
+      <!-- MTGFCIEncoder -->
+      <rect x="310" y="140" width="190" height="52" fill="#3d2a0a" stroke="#d4a047" stroke-width="1.2" rx="6"/>
+      <text x="320" y="156" class="lbl-title" fill="#d4a047">MTGFCIEncoder</text>
+      <text x="320" y="171" class="lbl-shape">→ (B, 256, 512)</text>
+      <text x="320" y="183" class="lbl-shape">256 spatial tokens</text>
+
+      <!-- MTGSpatialEncoder -->
+      <rect x="310" y="230" width="190" height="52" fill="#1a3020" stroke="#7aab7a" stroke-width="1.2" rx="6"/>
+      <text x="320" y="246" class="lbl-title" fill="#7aab7a">MTGSpatialEncoder</text>
+      <text x="320" y="261" class="lbl-shape">→ (B, 32, 32, 32)</text>
+      <text x="320" y="273" class="lbl-shape">spatial FiLM map</text>
+
+      <!-- LandCoverEmbedder -->
+      <rect x="310" y="340" width="190" height="52" fill="#2a1850" stroke="#a57de8" stroke-width="1.2" rx="6"/>
+      <text x="320" y="356" class="lbl-title" fill="#a57de8">LandCoverEmbedder</text>
+      <text x="320" y="371" class="lbl-shape">→ (B, 32, 32, 32)</text>
+      <text x="320" y="383" class="lbl-shape">embed + upsample</text>
+
+      <!-- NdviBackgroundEncoder -->
+      <rect x="310" y="450" width="190" height="52" fill="#1a3020" stroke="#7aab7a" stroke-width="1.2" rx="6"/>
+      <text x="320" y="466" class="lbl-title" fill="#7aab7a">NdviBackgroundEncoder</text>
+      <text x="320" y="481" class="lbl-shape">→ (B, 16, 32, 32)</text>
+      <text x="320" y="493" class="lbl-shape">Conv + ResBlock + 4×↓</text>
+
+      <!-- VAE Encoder -->
+      <rect x="820" y="540" width="180" height="52" fill="#3a1520" stroke="#c07a8a" stroke-width="1.2" rx="6"/>
+      <text x="830" y="558" class="lbl-title" fill="#c07a8a">VAE Encoder</text>
+      <text x="830" y="573" class="lbl-shape">→ (B, 32, 32, 32)</text>
+      <text x="830" y="585" class="lbl-shape">vae9d_cont frozen</text>
+
+      <!-- VAE Decoder -->
+      <rect x="820" y="380" width="180" height="52" fill="#3a1520" stroke="#c07a8a" stroke-width="1.2" rx="6"/>
+      <text x="830" y="398" class="lbl-title" fill="#c07a8a">VAE Decoder</text>
+      <text x="830" y="413" class="lbl-shape">→ (B, 1, 256, 256)</text>
+      <text x="830" y="425" class="lbl-shape">inference only</text>
+
+      <!-- cat concat node -->
+      <rect x="530" y="390" width="200" height="80" fill="#2a1850" stroke="#a57de8" stroke-width="1.5" rx="6"/>
+      <text x="630" y="412" text-anchor="middle" class="lbl-title" fill="#a57de8">cat [ latent | LC | NDVI ]</text>
+      <text x="630" y="430" text-anchor="middle" class="lbl-shape">(B, 32, 32, 32)</text>
+      <text x="630" y="445" text-anchor="middle" class="lbl-shape">+ (B, 32, 32, 32)</text>
+      <text x="630" y="460" text-anchor="middle" class="lbl-shape">+ (B, 16, 32, 32)</text>
+      <text x="630" y="475" text-anchor="middle" class="lbl-shape">= (B, 80, 32, 32) →</text>
+
+      <!-- UNet conv_in -->
+      <rect x="530" y="300" width="200" height="56" fill="#162030" stroke="#a57de8" stroke-width="1.2" rx="6"/>
+      <text x="630" y="320" text-anchor="middle" class="lbl-title" fill="#a57de8">UNet conv_in</text>
+      <text x="630" y="337" text-anchor="middle" class="lbl-shape">(B, 80, 32, 32) → hidden</text>
+      <text x="630" y="352" text-anchor="middle" class="lbl-shape">80 in_ch (patched)</text>
+
+      <!-- SpatialFiLM -->
+      <rect x="530" y="218" width="200" height="52" fill="#1a3020" stroke="#7aab7a" stroke-width="1.2" rx="6"/>
+      <text x="630" y="238" text-anchor="middle" class="lbl-title" fill="#7aab7a">SpatialFiLM</text>
+      <text x="630" y="253" text-anchor="middle" class="lbl-shape">scale·tanh(γ)+shift</text>
+      <text x="630" y="267" text-anchor="middle" class="lbl-shape">modulates after conv_in</text>
+
+      <!-- Context merge -->
+      <rect x="530" y="80" width="200" height="56" fill="#162030" stroke="#5b9bd5" stroke-width="1.2" rx="6"/>
+      <text x="630" y="100" text-anchor="middle" class="lbl-title" fill="#5b9bd5">cat [ ERA5 | MTG ] tokens</text>
+      <text x="630" y="117" text-anchor="middle" class="lbl-shape">(B, 15, 512)</text>
+      <text x="630" y="132" text-anchor="middle" class="lbl-shape">+ (B, 256, 512) = (B, 271, 512)</text>
+
+      <!-- UNet Cross-Attention -->
+      <rect x="530" y="155" width="200" height="52" fill="#162030" stroke="#5b9bd5" stroke-width="1.2" rx="6"/>
+      <text x="630" y="174" text-anchor="middle" class="lbl-title" fill="#5b9bd5">UNet Cross-Attention</text>
+      <text x="630" y="190" text-anchor="middle" class="lbl-shape">Q=hidden  KV=ctx (B,271,512)</text>
+      <text x="630" y="204" text-anchor="middle" class="lbl-shape">all res-attn blocks</text>
+
+      <!-- UNet output -->
+      <rect x="530" y="530" width="200" height="52" fill="#162030" stroke="#c07a8a" stroke-width="1.2" rx="6"/>
+      <text x="630" y="550" text-anchor="middle" class="lbl-title" fill="#c07a8a">UNet output</text>
+      <text x="630" y="567" text-anchor="middle" class="lbl-shape">ε_pred (B, 32, 32, 32)</text>
+      <text x="630" y="582" text-anchor="middle" class="lbl-shape">denoised latent</text>
+
+      <!-- noisy latent -->
+      <rect x="530" y="476" width="200" height="40" fill="#0f1923" stroke="#c07a8a" stroke-width="1" rx="4" stroke-dasharray="4 3"/>
+      <text x="630" y="493" text-anchor="middle" class="lbl-shape" fill="#c07a8a">noisy latent z_t</text>
+      <text x="630" y="508" text-anchor="middle" class="lbl-shape">(B, 32, 32, 32) + σ noise</text>
+
+      <!-- Arrows -->
+      <path d="M 172 68 L 308 68" fill="none" stroke="#5b9bd5" stroke-width="1.5" marker-end="url(#arr-era5)"/>
+      <path d="M 500 68 L 528 108" fill="none" stroke="#5b9bd5" stroke-width="1.5" marker-end="url(#arr-era5)"/>
+      <path d="M 172 166 L 308 166" fill="none" stroke="#d4a047" stroke-width="1.5" marker-end="url(#arr-mtg)"/>
+      <path d="M 100 192 L 100 215 Q 100 230 120 230 L 308 256" fill="none" stroke="#7aab7a" stroke-width="1.5" marker-end="url(#arr-spa)"/>
+      <path d="M 500 166 L 520 120 Q 528 108 528 108" fill="none" stroke="#d4a047" stroke-width="1.5" marker-end="url(#arr-mtg)"/>
+      <path d="M 630 136 L 630 153" fill="none" stroke="#5b9bd5" stroke-width="1.5" marker-end="url(#arr-era5)"/>
+      <path d="M 500 256 L 528 244" fill="none" stroke="#7aab7a" stroke-width="1.5" marker-end="url(#arr-spa)"/>
+      <path d="M 630 270 L 630 298" fill="none" stroke="#7aab7a" stroke-width="1.5" marker-end="url(#arr-spa)"/>
+      <path d="M 172 366 L 308 366" fill="none" stroke="#a57de8" stroke-width="1.5" marker-end="url(#arr-cat)"/>
+      <path d="M 172 476 L 308 476" fill="none" stroke="#7aab7a" stroke-width="1.5" marker-end="url(#arr-spa)"/>
+      <path d="M 500 366 L 528 420" fill="none" stroke="#a57de8" stroke-width="1.5" marker-end="url(#arr-cat)"/>
+      <path d="M 500 476 L 528 450" fill="none" stroke="#7aab7a" stroke-width="1.5" marker-end="url(#arr-spa)"/>
+      <path d="M 630 476 L 630 472" fill="none" stroke="#c07a8a" stroke-width="1.5" marker-end="url(#arr-rose)"/>
+      <path d="M 630 390 L 630 358" fill="none" stroke="#a57de8" stroke-width="1.5" marker-end="url(#arr-cat)"/>
+      <path d="M 630 207 L 630 216" fill="none" stroke="#5b9bd5" stroke-width="1.5" marker-end="url(#arr-era5)"/>
+      <path d="M 700 328 Q 760 328 760 207 L 732 207" fill="none" stroke="#a57de8" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arr-cat)"/>
+      <path d="M 630 270 Q 760 270 760 530 L 732 556" fill="none" stroke="#c07a8a" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arr-rose)"/>
+      <path d="M 730 556 L 818 422" fill="none" stroke="#7a8899" stroke-width="1.5" stroke-dasharray="4 3" marker-end="url(#arr-muted)"/>
+      <path d="M 172 586 L 818 566" fill="none" stroke="#c07a8a" stroke-width="1.5" stroke-dasharray="3 2" marker-end="url(#arr-rose)"/>
+      <path d="M 820 566 Q 780 530 732 498" fill="none" stroke="#c07a8a" stroke-width="1.5" marker-end="url(#arr-rose)"/>
+
+      <!-- Labels -->
+      <text x="1005" y="408" text-anchor="end" font-family="ui-monospace,monospace" font-size="9" fill="#c07a8a">NDVI (B,1,256,256)</text>
+      <text x="414" y="122" text-anchor="middle" font-family="system-ui,sans-serif" font-size="9.5" fill="#5b9bd5" opacity="0.8">cross-attention ctx</text>
+      <text x="444" y="240" font-family="system-ui,sans-serif" font-size="9.5" fill="#7aab7a" opacity="0.8">FiLM</text>
+      <text x="424" y="505" font-family="system-ui,sans-serif" font-size="9.5" fill="#a57de8" opacity="0.8">channel-concat</text>
+      <text x="350" y="610" font-family="system-ui,sans-serif" font-size="9" fill="#7a8899">training only →</text>
+      <text x="700" y="630" text-anchor="middle" font-family="system-ui,sans-serif" font-size="9" fill="#7a8899">← inference only</text>
+      <text x="740" y="488" font-family="ui-monospace,monospace" font-size="9" fill="#c07a8a">EDM σ</text>
+    </svg>
+  </div>
+
+  <!-- Summary table -->
+  <div style="max-width:780px;width:100%;">
+    <table style="width:100%;border-collapse:collapse;font-size:0.78rem;font-family:ui-monospace,monospace;">
+      <thead>
+        <tr style="border-bottom:1px solid #1e2e40;">
+          <th style="text-align:left;padding:6px 10px;color:#7a8899;font-weight:600;letter-spacing:.06em;">Path</th>
+          <th style="text-align:left;padding:6px 10px;color:#7a8899;font-weight:600;letter-spacing:.06em;">Mechanism</th>
+          <th style="text-align:left;padding:6px 10px;color:#7a8899;font-weight:600;letter-spacing:.06em;">Shape into UNet</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr style="border-bottom:1px solid #1a2535;">
+          <td style="padding:6px 10px;color:#5b9bd5;">ERA5 (12 vars × 15 days)</td>
+          <td style="padding:6px 10px;color:#e8e4dd;">ERA5TokenEncoder → cross-attention KV</td>
+          <td style="padding:6px 10px;color:#7a8899;">(B, 15, 512) tokens</td>
+        </tr>
+        <tr style="border-bottom:1px solid #1a2535;">
+          <td style="padding:6px 10px;color:#d4a047;">MTG FCI (18 ch)</td>
+          <td style="padding:6px 10px;color:#e8e4dd;">MTGFCIEncoder → cross-attention KV</td>
+          <td style="padding:6px 10px;color:#7a8899;">(B, 256, 512) tokens</td>
+        </tr>
+        <tr style="border-bottom:1px solid #1a2535;">
+          <td style="padding:6px 10px;color:#7aab7a;">MTG FCI (18 ch)</td>
+          <td style="padding:6px 10px;color:#e8e4dd;">MTGSpatialEncoder → SpatialFiLM scale/shift</td>
+          <td style="padding:6px 10px;color:#7a8899;">(B, 32, 32, 32) map</td>
+        </tr>
+        <tr style="border-bottom:1px solid #1a2535;">
+          <td style="padding:6px 10px;color:#a57de8;">Land Cover (IGBP)</td>
+          <td style="padding:6px 10px;color:#e8e4dd;">LandCoverEmbedder → channel-concat</td>
+          <td style="padding:6px 10px;color:#7a8899;">32 ch at 32×32</td>
+        </tr>
+        <tr style="border-bottom:1px solid #1a2535;">
+          <td style="padding:6px 10px;color:#7aab7a;">MOD13A3 prev-month NDVI</td>
+          <td style="padding:6px 10px;color:#e8e4dd;">NdviBackgroundEncoder → channel-concat</td>
+          <td style="padding:6px 10px;color:#7a8899;">16 ch at 32×32</td>
+        </tr>
+        <tr>
+          <td style="padding:6px 10px;color:#c07a8a;">Noisy latent z_t</td>
+          <td style="padding:6px 10px;color:#e8e4dd;">VAE enc (train) → add EDM noise → channel-concat</td>
+          <td style="padding:6px 10px;color:#7a8899;">32 ch at 32×32</td>
+        </tr>
+      </tbody>
+    </table>
+    <p style="font-size:0.72rem;color:#3a4f68;margin-top:0.6rem;font-family:ui-monospace,monospace;">
+      UNet conv_in receives 80 input channels total: 32 (latent) + 32 (LC) + 16 (NDVI bg).
+      Combined cross-attn context = 271 tokens × 512 dim.
+    </p>
+  </div>
+</div>
+
+</body>
+</html>
