@@ -15,6 +15,7 @@ from .general import (
     download_collection_tiffs,
     list_mtg_fci_objects,
     upload_zarr_to_huggingface,
+    upload_file_to_huggingface,
     prepare,
     build_timeseries,
     process_gdf,
@@ -28,4 +29,9 @@ from .visualization import (
     plot_day_across_tiles,
     inspect_raster_resolution,
 )
-from .data_utils import bbox_size_km, tile_has_min_land_fraction, plot_boxes_on_map
+try:
+    # plot_boxes_on_map needs cartopy (optional `viz` extra); bbox_size_km and
+    # tile_has_min_land_fraction don't, but live in the same module.
+    from .data_utils import bbox_size_km, tile_has_min_land_fraction, plot_boxes_on_map
+except ImportError:
+    pass

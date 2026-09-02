@@ -407,7 +407,15 @@ def upload_zarr_to_huggingface(
     """
     Upload a local Zarr store directory to a HuggingFace repository using
     upload_large_folder, which handles chunking, retries, and parallel uploads.
-    The folder contents are uploaded to the repo root.
+
+    upload_large_folder's scan phase enumerates everything under `folder_path`
+    before `allow_patterns` narrows it down, so pointing it at a shared parent
+    directory (with sibling Zarr stores) makes it walk/stat every sibling store
+    too -- on an NFS mount with several huge sibling stores this reproducibly
+    stalls indefinitely (confirmed via /proc/<pid>/io + wchan=rpc_wait_bit_killable).
+    Instead, the store is moved (cheap rename, no data copy) into an isolated
+    "_upload_tmp/<name>" wrapper directory first, so the scanner only ever sees
+    the one store being uploaded; it's moved back afterwards regardless of outcome.
 
     Args:
         local_zarr_path: Path to the local Zarr directory to upload.
@@ -418,22 +426,80 @@ def upload_zarr_to_huggingface(
     """
     from huggingface_hub import HfApi
     from dotenv import load_dotenv
+    import shutil
     load_dotenv()
 
     local_zarr_path = Path(local_zarr_path)
     if not local_zarr_path.exists():
         raise FileNotFoundError(f"Zarr path not found: {local_zarr_path}")
 
+    zarr_dir = local_zarr_path.parent
+    name = local_zarr_path.name
+    tmp_parent = zarr_dir / "_upload_tmp"
+    tmp_zarr = tmp_parent / name
+
+    if tmp_parent.exists():
+        shutil.rmtree(tmp_parent)
+    tmp_parent.mkdir()
+    local_zarr_path.rename(tmp_zarr)
+
     api = HfApi(token=token or os.getenv("HF_TOKEN"))
     api.create_repo(repo_id=repo_id, repo_type=repo_type, exist_ok=True)
 
-    api.upload_large_folder(
-        folder_path=str(local_zarr_path),
+    try:
+        api.upload_large_folder(
+            folder_path=str(tmp_parent),
+            repo_id=repo_id,
+            repo_type=repo_type,
+            num_workers=num_workers,
+        )
+        logger.info(
+            f"Uploaded {local_zarr_path} → https://huggingface.co/{repo_type}s/{repo_id}/tree/main/{name}"
+        )
+    finally:
+        if tmp_zarr.exists():
+            tmp_zarr.rename(local_zarr_path)
+        if tmp_parent.exists():
+            shutil.rmtree(tmp_parent, ignore_errors=True)
+
+
+def upload_file_to_huggingface(
+    local_file_path: Path | str,
+    repo_id: str,
+    repo_type: str = "dataset",
+    token: str | None = None,
+    path_in_repo: str | None = None,
+) -> None:
+    """
+    Upload a single local file to a HuggingFace repository.
+
+    Args:
+        local_file_path: Path to the local file to upload.
+        repo_id: HuggingFace repo in the form 'username/repo-name'.
+        repo_type: 'dataset', 'model', or 'space' (default: 'dataset').
+        token: HuggingFace token; falls back to HF_TOKEN env var or cached login.
+        path_in_repo: Destination path in the repo; defaults to
+            "<parent-dir-name>/<file-name>" (e.g. "vae/vae9d_cont-step059444-recon0.0003.ckpt").
+    """
+    from huggingface_hub import HfApi
+    from dotenv import load_dotenv
+    load_dotenv()
+
+    local_file_path = Path(local_file_path)
+    if not local_file_path.is_file():
+        raise FileNotFoundError(f"File not found: {local_file_path}")
+
+    dest = path_in_repo or f"{local_file_path.parent.name}/{local_file_path.name}"
+
+    api = HfApi(token=token or os.getenv("HF_TOKEN"))
+    api.create_repo(repo_id=repo_id, repo_type=repo_type, exist_ok=True)
+    api.upload_file(
+        path_or_fileobj=str(local_file_path),
+        path_in_repo=dest,
         repo_id=repo_id,
         repo_type=repo_type,
-        num_workers=num_workers,
     )
-    logger.info(f"Uploaded {local_zarr_path} → https://huggingface.co/{repo_type}s/{repo_id}")
+    logger.info(f"Uploaded {local_file_path} → https://huggingface.co/{repo_type}s/{repo_id}/blob/main/{dest}")
 
 
 def prepare(dataset:Union[xr.DataArray, xr.Dataset]):
