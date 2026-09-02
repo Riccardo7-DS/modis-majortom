@@ -8,6 +8,14 @@ authors = [
 readme = "README.md"
 requires-python = ">=3.11, <3.14"
 
+# `majortom` (MajorTOM grid definitions, used by transform/majortom.py) is not published
+# on PyPI, so it can't be declared as a normal dependency — it's pulled from the
+# ESA-PhiLab GitHub repo via [tool.uv.sources] below. A vanilla `pip install
+# modis-majortom` will not resolve it automatically; install it manually first:
+#   pip install "majortom @ git+https://github.com/ESA-PhiLab/Major-TOM.git"
+# `eumetsearch` (MTG FCI / MajorTOM alignment, used by transform/dataset.py) is likewise
+# not on PyPI yet — see its [tool.uv.sources] entry below, which points at a local
+# sibling checkout. Known limitation until both are published.
 dependencies = [
     "xarray>=2025.8.0",
     "numpy>=2.3.3",
@@ -24,10 +32,8 @@ dependencies = [
     "satpy>=0.58.0",
     "dotenv>=0.9.9",
     "pystac-client>=0.9.0",
-    "cartopy>=0.25.0",
     "minio>=7.2.20",
     "joblib>=1.5.3",
-    "timm>=1.0.22",
     "scipy",
     "matplotlib>=3.10.6",
     "pandas",
@@ -38,10 +44,21 @@ dependencies = [
     "eumetsearch[transform]",
 ]
 
+[project.optional-dependencies]
+# cartopy is only used by utils/data_utils.py's plot_boxes_on_map() (a plotting helper,
+# not core download/processing logic); modis_majortom.utils guards that import with
+# try/except so the package still imports without this extra installed.
+# Install with: pip install -e ".[viz]"
+viz = [
+    "cartopy>=0.25.0",
+]
+
 [tool.uv.sources]
 majortom = { git = "https://github.com/ESA-PhiLab/Major-TOM.git" }
 eumetsearch = { path = "../eumetsearch", editable = true }
 
+[dependency-groups]
+dev = ["pytest>=8.0.0"]
 
 [build-system]
 requires = ["hatchling"]

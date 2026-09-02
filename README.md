@@ -4,7 +4,8 @@ A Python package for downloading, processing, and archiving MODIS satellite data
 
 This README covers the data acquisition/processing package. For the NDVI latent diffusion model
 built on top of this data (architecture, model version lineage, and how to reproduce a training
-run), see [`docs/DIFFUSION_MODEL.md`](docs/DIFFUSION_MODEL.md).
+run), see the sibling [`ndvi-diffusion`](../ndvi-diffusion) repository, which consumes this
+package as a dependency (`docs/DIFFUSION_MODEL.md` there has the full write-up).
 
 ## Features
 
@@ -216,7 +217,9 @@ Processing steps:
 
 The `meta_mask_channel` output is designed as a conditioning input for cloud inpainting models.
 
-An optional `CloudAdapterModel` (DINOv2 ViT-S/14 backbone + lightweight adapter + upsampling decoder) is available for learning-based cloud probability estimation.
+A learning-based cloud probability model (`CloudAdapterModel`: DINOv2 ViT-S/14 backbone +
+lightweight adapter + upsampling decoder) built on top of these functions lives in the sibling
+[`ndvi-diffusion`](../ndvi-diffusion) repository (`ndvi_diffusion.datasets.cloud_adapter_model`).
 
 ## Output Structure
 
@@ -267,4 +270,4 @@ data/modis/
 
 ## License
 
-See [LICENSE](LICENSE) for details.
+See [LICENSE.txt](LICENSE.txt) for details.

@@ -1,65 +1,48 @@
 """
 dataset.py
 ==========
-Spatially-aligned multi-source PyTorch Dataset for MTG FCI + MODIS.
+Ancillary data source loaders for MTG FCI + MODIS spatial alignment.
 
-Each sample exposes two tensors on a common Earth-fixed AEQD grid centred on
-the MajorTOM cell:
+Defines the ``AncillarySource`` interface and the concrete numpy/zarr/xarray
+loaders (``MODISSource``, ``RawGAMODISSource``, ``MOD13A3Source``,
+``ERA5Source``, ``LAISource``) used to build spatially-aligned training
+samples. These loaders have no torch dependency so they can be imported from
+a lightweight ``modis-majortom`` install.
 
-    X : (18, H, W) float32 — MTG FCI multi-temporal conditioning tensor
-        Channels 0-14  : 5 timestamps x [vis06, vis08, cos_sza] (chronological,
-                         zero-padded if fewer than 5 timestamps are available)
-        Channel 15     : NDVI75    — 75th-percentile NDVI across the 5 timestamps
-        Channel 16     : NDVI_std  — temporal std of NDVI across the 5 timestamps
-        Channel 17     : CloudScore — fraction of cloud-flagged timestamps [0, 1]
+The torch-dependent consumer of these sources — ``AlignedPatchDataset`` (a
+``torch.utils.data.Dataset``) and its companion ``build_sample_index`` — now
+lives in the ``ndvi-diffusion`` sibling package at
+``ndvi_diffusion.datasets.patch_dataset``, which imports the classes below
+as an external ``modis_majortom`` dependency.
 
-    target_ndvi : (1, H, W) float32 — blended NDVI target
-        ``soft_score * ndvi_observed + (1 − soft_score) * ndvi_whittaker``,
-        clamped to [−1, 1].  NaN filled from Whittaker; 0 as last resort.
-    loss_weight : (1, H, W) float32 — per-pixel training weight
-        ``soft_score + alpha * (1 − soft_score)`` (default alpha = 0.2).
-    meta_mask   : (1, H, W) float32 — reliable-observation mask
-        Equal to soft_score where soft_score ≥ 0.5, else 0.
-
-Pixel [i, j] in X and Y refers to the same point on the ground.
-Geometry and reprojection are handled by ``eumetsearch.transform``.
+Pixel [i, j] in the aligned tensors produced downstream refers to the same
+point on the ground. Geometry and reprojection are handled by
+``eumetsearch.transform``.
 """
 
 from __future__ import annotations
 
-import logging
 import threading
-import warnings
 from abc import ABC, abstractmethod
-from datetime import datetime
 from pathlib import Path
 from typing import Union
 
 import numpy as np
-import torch
 import zarr
-from scipy.ndimage import laplace as _ndimage_laplace, map_coordinates
-from torch.utils.data import Dataset
+from scipy.ndimage import map_coordinates
 
 from eumetsearch.transform import (
     TargetGrid,
-    MODISGeometry,
     modis_patch_corner_for_cell,
     grid_id_to_latlon,
 )
 from eumetsearch.transform.fci_modis_align import (
     _aeqd_to_latlon,
-    _latlon_to_fci_px,
     _latlon_to_modis_px,
     _sample_array,
 )
-from eumetsearch.transform.ndvi import _build_fci_index
 from ..utils import compute_ndvi
-from ..utils.mtg_reliability import compute_mtg_composites
-from ..utils.solar import compute_cos_sza as _compute_cos_sza
 from .cloud_adapter import upsample_500_to_250
-
-_LOG = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -504,7 +487,7 @@ class ERA5Source(AncillarySource):
 
 
 # ---------------------------------------------------------------------------
-# 5.  LAISource
+# 6.  LAISource
 # ---------------------------------------------------------------------------
 
 def _fparlai_qc_bad(qc: np.ndarray) -> np.ndarray:
@@ -649,471 +632,3 @@ class LAISource(AncillarySource):
         h, w = next(iter(bands.values())).shape[-2:]
         frac_row, frac_col = _latlon_to_modis_px(lat, lon, row0, col0, h, w)
         return {k: _sample_array(v, frac_row, frac_col) for k, v in bands.items()}
-
-
-# ---------------------------------------------------------------------------
-# 6.  AlignedPatchDataset
-# ---------------------------------------------------------------------------
-
-class AlignedPatchDataset(Dataset):
-    """Spatially-aligned MTG FCI + MODIS PyTorch Dataset.
-
-    Each sample returns two tensors on a shared AEQD grid:
-
-    ``X`` : (18, H, W) float32
-        Multi-temporal FCI conditioning tensor.
-        Channels 0–14: 5 timestamps x ``[vis06, vis08, cos_sza]`` (chronological;
-        zero-padded if fewer than 5 timestamps are available).
-        Channels 15–17: ``[NDVI75, NDVI_std, CloudScore]`` — temporal
-        reliability composites derived across the 5 timestamps.
-
-    ``target_ndvi`` : (1, H, W) float32
-        Blended NDVI target: ``soft_score * ndvi_observed + (1−soft_score) * ndvi_whittaker``,
-        clamped to [−1, 1].  NaN pixels fall back to ``ndvi_whittaker``; then 0.
-    ``loss_weight`` : (1, H, W) float32
-        Per-pixel training weight: ``soft_score + alpha * (1−soft_score)``.
-        Full weight for clear pixels, reduced (alpha-scaled) for cloudy/gap-filled pixels.
-    ``meta_mask`` : (1, H, W) float32
-        Reliable-observation flag: ``soft_score`` where ``soft_score ≥ 0.5``, else 0.
-
-    ``target_lai`` / ``lai_mask`` : (1, H, W) float32, only present when ``lai_source`` is set
-        Sparse LAI/FAPAR supervision (see ``LAISource``). ``lai_mask`` is 0
-        everywhere for samples whose date has no real MCD15A3H composite (and
-        per-pixel 0 for QC-bad pixels within a valid composite); ``target_lai``
-        is 0 wherever ``lai_mask`` is 0. Not densified/interpolated — this is
-        deliberately sparse-in-time supervision, see project memory.
-    ``target_fpar`` / ``fpar_mask`` : (1, H, W) float32, only present when
-        ``lai_source.has_fpar`` is True (i.e. constructed with
-        ``fpar_band="Fpar_500m"``). Same sparse-supervision semantics as
-        ``target_lai``/``lai_mask``, independently masked (FAPAR NaN pattern
-        can differ slightly from LAI's even though both share ``FparLai_QC``).
-
-    Parameters
-    ----------
-    fci_store_path :
-        Path to the MTG FCI zarr store (MajorTOM format).
-    ancillary_sources :
-        Dict mapping source name → ``AncillarySource``.
-        Must include ``"modis": MODISSource(...)``.
-    samples :
-        ``[(grid_id, date), ...]`` index — build with :func:`build_sample_index`.
-    target_n_pixels :
-        Output spatial resolution (square, default 256).
-    alpha :
-        Weight floor for cloud-contaminated pixels (default 0.2).
-    lai_source :
-        Optional ``LAISource`` for sparse LAI/FAPAR supervision. Deliberately
-        kept out of ``ancillary_sources`` — see ``LAISource`` docstring for why
-        it must not participate in ``build_sample_index`` filtering.
-    """
-
-    def __init__(
-        self,
-        fci_store_path: Union[str, Path],
-        ancillary_sources: dict[str, AncillarySource],
-        samples: list[tuple[str, str]],
-        target_n_pixels: int = 256,
-        alpha: float = 0.2,
-        whittaker_target: bool = False,
-        lai_source: "LAISource | None" = None,
-        mod13a3_source: "MOD13A3Source | None" = None,
-    ) -> None:
-        if "modis" not in ancillary_sources:
-            raise ValueError("ancillary_sources must include a 'modis' key (MODISSource)")
-        self._fci_store_path   = str(fci_store_path)
-        self.ancillary_sources = ancillary_sources
-        self.samples           = list(samples)
-        self.target_n_pixels   = target_n_pixels
-        self._alpha            = alpha
-        self._whittaker_target = whittaker_target
-        self.lai_source        = lai_source
-        self.mod13a3_source    = mod13a3_source
-        self._local            = threading.local()
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    @property
-    def _fci_store(self):
-        if not hasattr(self._local, "fci_store"):
-            self._local.fci_store = zarr.open(self._fci_store_path, mode="r")
-        return self._local.fci_store
-
-    def __getitem__(self, idx: int) -> dict:
-        grid_id, date = self.samples[idx]
-        lat, lon = grid_id_to_latlon(grid_id)
-
-        fci_store = self._fci_store
-        fci_index = _build_fci_index(fci_store, date)
-        if grid_id not in fci_index:
-            raise KeyError(f"No FCI data for {grid_id!r} on {date!r}")
-        ts_rows = fci_index[grid_id]  # {timestamp: row_index}
-
-        # Shared AEQD grid — same extent as the MODIS patch
-        target_grid = TargetGrid(
-            cell_lat=lat,
-            cell_lon=lon,
-            extent_m=MODISGeometry.PATCH_EXTENT_M / 2,
-            n_pixels=self.target_n_pixels,
-        )
-
-        # X: multi-temporal FCI conditioning tensor (18, H, W)
-        X = self._build_mtg_conditioning(fci_store, ts_rows, target_grid)
-
-        # Load and reproject three MODIS NDVI-related arrays onto the shared AEQD grid
-        modis_src      = self.ancillary_sources["modis"]
-        modis_bands    = modis_src.load(grid_id, date)
-        mod_r0, mod_c0 = modis_src.patch_origin(lat, lon)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            aligned = modis_src.reproject(modis_bands, mod_r0, mod_c0, target_grid)
-
-        ndvi_obs      = aligned["ndvi_observed"]   # (H, W) float32
-        ndvi_whi      = aligned["ndvi_whittaker"]  # (H, W) float32
-        soft          = aligned["soft_score"]      # (H, W) float32
-        gap_cloud_mask = aligned.get("gap_cloud_mask")  # (H, W) float32 | None
-
-        # Clamp soft_score to [0, 1]; treat NaN as fully uncertain (0)
-        soft = np.clip(np.nan_to_num(soft, nan=0.0), 0.0, 1.0)
-
-        if self._whittaker_target:
-            # Pure Whittaker reconstruction as target (cloud-free by construction)
-            target_ndvi = np.clip(ndvi_whi, -1.0, 1.0)
-            nan_mask = np.isnan(target_ndvi)
-            if nan_mask.any():
-                target_ndvi[nan_mask] = 0.0
-        else:
-            # Blend: confident-clear pixels use observed NDVI; uncertain pixels use Whittaker
-            target_ndvi = soft * ndvi_obs + (1.0 - soft) * ndvi_whi
-            target_ndvi = np.clip(target_ndvi, -1.0, 1.0)
-
-            # Fill any NaN that survived blending (both ndvi_obs and ndvi_whi were NaN)
-            nan_mask = np.isnan(target_ndvi)
-            if nan_mask.any():
-                target_ndvi[nan_mask] = ndvi_whi[nan_mask]
-                still_nan = np.isnan(target_ndvi)
-                if still_nan.any():
-                    target_ndvi[still_nan] = 0.0
-
-        # Full weight for clear observations; alpha-scaled floor for cloudy/gap-filled pixels
-        loss_weight = soft + self._alpha * (1.0 - soft)
-
-        # Conditioning mask: pass soft_score through only where it signals reliable obs
-        meta_mask = np.where(soft >= 0.5, soft, 0.0).astype(np.float32)
-
-        def _to_tensor(arr: np.ndarray) -> torch.Tensor:
-            return torch.from_numpy(arr[np.newaxis].astype(np.float32))  # (1, H, W)
-
-        sample: dict = {
-            "X":           X,
-            "target_ndvi": _to_tensor(target_ndvi),
-            "loss_weight": _to_tensor(loss_weight),
-            "meta_mask":   _to_tensor(meta_mask),
-            "grid_id":     grid_id,
-            "date":        date,
-            "cell_lat":    lat,
-            "cell_lon":    lon,
-        }
-        if gap_cloud_mask is not None:
-            sample["whittaker_cloud_mask"] = _to_tensor(gap_cloud_mask)
-
-        # ERA5 ancillary — optional; shape (N_vars, n_days, H, W)
-        era5_src = self.ancillary_sources.get("era5")
-        if era5_src is not None:
-            era5_bands = era5_src.load(grid_id, date)
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                era5_aligned = era5_src.reproject(era5_bands, 0, 0, target_grid)
-            era5_stack = np.stack(
-                [era5_aligned[v] for v in era5_src.variables], axis=0
-            )  # (N_vars, n_days, H, W)
-            sample["era5"] = torch.from_numpy(era5_stack.astype(np.float32))
-
-        # Land cover ancillary — optional; static per grid_id, date ignored
-        # Shape: (N_lc_vars, H, W) float32 with IGBP class indices 0-17
-        lc_src = self.ancillary_sources.get("land_cover")
-        if lc_src is not None:
-            lc_bands   = lc_src.load(grid_id, date)
-            lc_aligned = lc_src.reproject(lc_bands, 0, 0, target_grid)
-            lc_stack   = np.stack([lc_aligned[v] for v in lc_src.variables], axis=0)
-            sample["land_cover"] = torch.from_numpy(lc_stack.astype(np.float32))
-
-        # LAI/FAPAR ancillary — optional, sparse (MCD15A3H 4-day composite calendar).
-        # Unlike era5/land_cover, real data only exists on ~1-in-4 dates; when this
-        # sample's date isn't a real composite date (or the grid_id is missing that
-        # date), target_lai/lai_mask are zero-filled so the LAI head gets no gradient
-        # for this sample — see LAISource and EDMDiffusion._lai_loss.
-        if self.lai_source is not None:
-            H = W = self.target_n_pixels
-            if self.lai_source.has(grid_id, date):
-                lai_bands      = self.lai_source.load(grid_id, date)
-                lai_r0, lai_c0 = self.lai_source.patch_origin(lat, lon)
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    lai_aligned = self.lai_source.reproject(lai_bands, lai_r0, lai_c0, target_grid)
-                lai_arr    = lai_aligned["lai"]     # (H, W), NaN where fill/out-of-range
-                lai_qc     = lai_aligned["lai_qc"]  # (H, W), 1=good quality, 0=excluded
-                lai_valid  = np.isfinite(lai_arr) & (lai_qc > 0.5)
-                target_lai = np.where(lai_valid, lai_arr, 0.0).astype(np.float32)
-                lai_mask   = lai_valid.astype(np.float32)
-
-                if self.lai_source.has_fpar:
-                    fpar_arr     = lai_aligned["fpar"]
-                    fpar_qc      = lai_aligned["fpar_qc"]
-                    fpar_valid   = np.isfinite(fpar_arr) & (fpar_qc > 0.5)
-                    target_fpar  = np.where(fpar_valid, fpar_arr, 0.0).astype(np.float32)
-                    fpar_mask    = fpar_valid.astype(np.float32)
-            else:
-                target_lai = np.zeros((H, W), dtype=np.float32)
-                lai_mask   = np.zeros((H, W), dtype=np.float32)
-                if self.lai_source.has_fpar:
-                    target_fpar = np.zeros((H, W), dtype=np.float32)
-                    fpar_mask   = np.zeros((H, W), dtype=np.float32)
-
-            sample["target_lai"] = _to_tensor(target_lai)
-            sample["lai_mask"]   = _to_tensor(lai_mask)
-            if self.lai_source.has_fpar:
-                sample["target_fpar"] = _to_tensor(target_fpar)
-                sample["fpar_mask"]   = _to_tensor(fpar_mask)
-
-        # MOD13A3 monthly NDVI background — optional; (1, 128, 128) float32
-        if self.mod13a3_source is not None:
-            monthly = self.mod13a3_source.load(grid_id, date)
-            sample["ndvi_monthly"] = torch.from_numpy(
-                monthly["ndvi_monthly"][np.newaxis].astype(np.float32)
-            )
-
-        return sample
-
-    def _build_mtg_conditioning(
-        self,
-        fci_store,
-        ts_rows: dict[str, int],
-        target_grid: TargetGrid,
-    ) -> torch.Tensor:
-        """Build the multi-temporal FCI conditioning tensor.
-
-        Returns
-        -------
-        mtg_conditioning : torch.Tensor, shape (18, H, W), float32
-            Channels 0–14 : 5 timestamps x [vis06, vis08, cos_sza] per observation.
-            Channels 15–17: [NDVI75, NDVI_std, CloudScore] composites.
-        """
-        H = W = target_grid.n_px
-        timestamps = sorted(ts_rows.keys())
-
-        # Per-pixel lat/lon on the AEQD grid — used for cos_sza computation
-        lat_deg, lon_deg = _aeqd_to_latlon(target_grid)
-
-        # FCI fractional coords — patch_origins are invariant across timestamps
-        # for the same grid_id (fixed geographic footprint); read once.
-        first_ts  = timestamps[0]
-        first_row = ts_rows[first_ts]
-        r0, c0 = fci_store["patches"]["vis_06"][first_ts]["patch_origins"][first_row]
-        frac_row_fci, frac_col_fci = _latlon_to_fci_px(
-            lat_deg, lon_deg, int(r0), int(c0),
-            fci_patch_h=128, fci_patch_w=128,
-        )
-
-        obs_frames: list[np.ndarray]  = []
-        ndvi_frames: list[np.ndarray] = []
-
-        for ts in timestamps[:5]:
-            row = ts_rows[ts]
-
-            vis06_raw = fci_store["patches"]["vis_06"][ts]["data"][row].astype(np.float32)
-            vis08_raw = fci_store["patches"]["vis_08"][ts]["data"][row].astype(np.float32)
-
-            vis06 = _sample_array(vis06_raw, frac_row_fci, frac_col_fci)
-            vis08 = _sample_array(vis08_raw, frac_row_fci, frac_col_fci)
-
-            # NDVI: FCI stores reflectances in percent (0–100+ scale).
-            # Require both channels ≥ 2% to mask near-zero-red artifacts
-            # (dark pixels where atmospheric absorption of red >> NIR produce
-            # spuriously high NDVI values when vis06 is 0.02–1%).
-            valid = (vis06 >= 2.0) & (vis08 >= 2.0)
-            denom = vis08 + vis06
-            ndvi = np.where(
-                valid & (denom > 0.0),
-                np.clip((vis08 - vis06) / denom, -1.0, 1.0),
-                0.0,
-            ).astype(np.float32)
-            ndvi_frames.append(ndvi)
-
-            dt_utc  = datetime.fromisoformat(ts)
-            cos_sza = _compute_cos_sza(lat_deg, lon_deg, dt_utc)
-            cos_sza = np.where(
-                np.isfinite(cos_sza), np.clip(cos_sza, 0.0, 1.0), 0.0
-            ).astype(np.float32)
-
-            obs_frames.append(np.stack([vis06, vis08, cos_sza], axis=0))
-
-        zero_frame = np.zeros((3, H, W), dtype=np.float32)
-        while len(obs_frames) < 5:
-            obs_frames.append(zero_frame)
-            ndvi_frames.append(np.zeros((H, W), dtype=np.float32))
-
-        mtg_stack   = np.stack(obs_frames, axis=0)   # (5, 3, H, W)
-        ndvi_stack  = np.stack(ndvi_frames, axis=0)  # (5, H, W)
-        vis08_stack = mtg_stack[:, 1]                # (5, H, W)
-
-        raw_channels = mtg_stack.reshape(5 * 3, H, W)              # (15, H, W)
-        composites   = compute_mtg_composites(ndvi_stack, vis08_stack)  # (3, H, W)
-
-        mtg_conditioning = np.concatenate(
-            [raw_channels, composites], axis=0
-        )  # (18, H, W)
-
-        return torch.from_numpy(np.ascontiguousarray(mtg_conditioning))
-
-
-# ---------------------------------------------------------------------------
-# 7.  build_sample_index
-# ---------------------------------------------------------------------------
-
-def _fci_coverage_filter(
-    fci_store,
-    max_nan_fraction: float,
-    sample_band: str = "vis_06",
-) -> set[str]:
-    """Return grid IDs whose MTG FCI NaN fraction ≤ max_nan_fraction.
-
-    Evaluates coverage from the first available timestamp (the geostationary
-    disk edge is fixed, so NaN patterns are stable across time).
-    Loads data in chunks to avoid a single large allocation.
-    """
-    timestamps = sorted(fci_store["patches"][sample_band].keys())
-    if not timestamps:
-        return set()
-    ts   = timestamps[0]
-    data = fci_store["patches"][sample_band][ts]["data"]   # zarr (N, H, W)
-    gids = [str(g) for g in fci_store["patches"][sample_band][ts]["grid_ids"][:]]
-    N    = data.shape[0]
-
-    valid: set[str] = set()
-    chunk = 2000
-    for start in range(0, N, chunk):
-        end        = min(start + chunk, N)
-        block      = np.array(data[start:end])              # (chunk, H, W)
-        nan_fracs  = np.isnan(block).mean(axis=(1, 2))
-        for i, nan_frac in enumerate(nan_fracs):
-            if nan_frac <= max_nan_fraction:
-                valid.add(gids[start + i])
-
-    n_removed = N - len(valid)
-    _LOG.info(
-        "MTG FCI coverage filter (max_nan=%.0f%%): kept %d / %d grid IDs "
-        "(removed %d = %.1f%%)",
-        max_nan_fraction * 100,
-        len(valid), N, n_removed, 100.0 * n_removed / max(N, 1),
-    )
-    return valid
-
-
-def build_sample_index(
-    fci_store_path: Union[str, Path],
-    ancillary_sources: dict[str, AncillarySource],
-    dates: list[str] | None = None,
-    max_fci_nan_fraction: float = 1.0,
-    max_ndvi_lap_var: float = 0.0,
-) -> list[tuple[str, str]]:
-    """Return all ``(grid_id, date)`` pairs for which every source has data.
-
-    Parameters
-    ----------
-    fci_store_path :
-        Path to the MTG FCI zarr store.
-    ancillary_sources :
-        Same dict passed to ``AlignedPatchDataset``.
-    dates :
-        Restrict to these ISO date strings.  If None, use all FCI dates.
-    max_fci_nan_fraction :
-        Drop grid IDs where the MTG FCI NaN fraction exceeds this value.
-        Default 1.0 = no filtering (backward compatible).
-        Recommended: 0.10 to remove tiles outside the geostationary disk
-        (typically ~13% of tiles, mostly Latin America / far east Pacific).
-    max_ndvi_lap_var :
-        Drop patches where ``var(laplace(ndvi_envelope[mask]))`` exceeds this
-        value (mask = soft_score > 0.5).  Computed at full 256×256 resolution
-        so pixel-level salt-and-pepper noise is caught (unlike downsampled
-        variants).  0.0 = disabled (default, backward compatible).
-        Recommended: 0.05 — cleanly separates coherent scenes (0.017–0.022)
-        from noise patches (≥ 0.099).
-
-    Notes
-    -----
-    Sources that return a non-empty ``available_dates()`` set are used to
-    further restrict the date range (e.g. ERA5Source needs n_days of
-    look-back history before the first sample date).  Sources that return
-    a non-empty ``available_grid_ids(date)`` set restrict which grid IDs
-    are included for that date.
-    """
-    fci_store = zarr.open(str(fci_store_path), mode="r")
-
-    # Build coverage filter (computed once; stable across timestamps)
-    fci_valid_gids: set[str] | None = None
-    if max_fci_nan_fraction < 1.0:
-        fci_valid_gids = _fci_coverage_filter(fci_store, max_fci_nan_fraction)
-
-    # Collect date restrictions from all sources
-    allowed_dates: set[str] | None = None
-    for source in ancillary_sources.values():
-        src_dates = source.available_dates()
-        if src_dates:
-            allowed_dates = src_dates if allowed_dates is None else (allowed_dates & src_dates)
-
-    fci_by_date: dict[str, set[str]] = {}
-    for ts_key in fci_store["patches"]["vis_06"].keys():
-        date = ts_key[:10]
-        if dates is not None and date not in dates:
-            continue
-        if allowed_dates is not None and date not in allowed_dates:
-            continue
-        gids = [str(g) for g in fci_store["patches"]["vis_06"][ts_key]["grid_ids"][:]]
-        fci_by_date.setdefault(date, set()).update(gids)
-
-    samples: list[tuple[str, str]] = []
-    for date, fci_gids in sorted(fci_by_date.items()):
-        available = fci_gids
-        if fci_valid_gids is not None:
-            available = available & fci_valid_gids
-        for source in ancillary_sources.values():
-            src_gids = source.available_grid_ids(date)
-            if src_gids:
-                available = available & src_gids
-        for gid in sorted(available):
-            samples.append((gid, date))
-
-    if max_ndvi_lap_var > 0.0:
-        # Find the first MODISSource with a processed zarr (ndvi_envelope + soft_score)
-        proc_store = None
-        for source in ancillary_sources.values():
-            if hasattr(source, "_processed_path"):
-                proc_store = zarr.open(source._processed_path, mode="r")
-                break
-        if proc_store is not None:
-            nd_grp = proc_store["patches"]["ndvi_envelope"]
-            ss_grp = proc_store["patches"]["soft_score"]
-            kept, n_dropped = [], 0
-            for gid, date in samples:
-                try:
-                    ndvi = nd_grp[date][gid][:].astype(np.float32)
-                    soft = ss_grp[date][gid][:]
-                    mask = soft > 0.5
-                    if mask.sum() < 100:
-                        kept.append((gid, date))
-                        continue
-                    lap_var = float(np.var(_ndimage_laplace(ndvi)[mask]))
-                    if lap_var <= max_ndvi_lap_var:
-                        kept.append((gid, date))
-                    else:
-                        n_dropped += 1
-                except Exception:
-                    kept.append((gid, date))
-            _LOG.info(
-                "Laplacian filter (max_ndvi_lap_var=%.4f): dropped %d / %d samples",
-                max_ndvi_lap_var, n_dropped, len(samples),
-            )
-            samples = kept
-
-    return samples
