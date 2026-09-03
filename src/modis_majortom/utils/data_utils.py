@@ -1,8 +1,6 @@
 import os
 import math
 import matplotlib.pyplot as plt
-import cartopy.crs as ccrs
-import cartopy.feature as cfeature
 
 
 def load_land_mask():
@@ -165,6 +163,9 @@ def tile_has_min_land_fraction(bbox, min_percentage=10, scale=500, debug=False):
 
 
 def plot_boxes_on_map(bboxes):
+    import cartopy.crs as ccrs
+    import cartopy.feature as cfeature
+
     fig = plt.figure(figsize=(10, 6))
     ax = plt.axes(projection=ccrs.PlateCarree())
     ax.add_feature(cfeature.COASTLINE)

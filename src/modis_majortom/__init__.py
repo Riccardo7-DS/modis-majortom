@@ -8,8 +8,6 @@ from .transform import (
     extract_modis_cube,
     extract_image,
     normalize_modis,
-    CloudAdapterModel,
-    CloudAdapterPipeline,
     CalculationsMajorTom,
     LandCoverTileExtractor,
     LandCoverSource,
