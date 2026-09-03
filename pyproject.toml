@@ -35,7 +35,6 @@ dependencies = [
     "matplotlib>=3.10.6",
     "pandas",
     "pyproj",
-    "majortom",
     "dask",
     "huggingface-hub>=0.23.0",
     "eumetsearch[transform]>=0.1.3",

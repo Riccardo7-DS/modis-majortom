@@ -13,6 +13,8 @@ lightning_logs/
 .github/
 __pycache__/
 **/__pycache__/
+.pytest_cache/
+.ruff_cache/
 *.pyc
 *.pyo
 *.pyd
