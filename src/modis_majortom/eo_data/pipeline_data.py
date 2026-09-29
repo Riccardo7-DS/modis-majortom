@@ -95,7 +95,8 @@ products = {
                           "SummaryQA"
             ],
             "raw_data_type" : "hdf",
-            "crs": "EPSG:6933"
+            "crs": "EPSG:6933",
+            "resolution": 1000
         },
         "VIIRS_500m_night_monthly": {
             "short_name": "VNP46A3",
@@ -210,7 +211,7 @@ else:
     np.save(Path(DATA_PATH) / "water_min.npy", np.array(water_min))
 
 logger.info(f"Selected {len(water_min)} tiles out of {len(bboxes)} total tiles")
-plot_boxes_on_map(water_min)
+# plot_boxes_on_map(water_min)
 
 # Loop over each bounding box and download
 for i, bbox in tqdm(enumerate(water_min), desc="Processing tiles for download", total=len(water_min)):

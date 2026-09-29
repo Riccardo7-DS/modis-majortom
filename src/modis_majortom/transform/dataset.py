@@ -131,9 +131,15 @@ class MODISSource(AncillarySource):
         raw  = self._raw_store["patches"]
         proc = self._processed_store["patches"]
 
-        # ndvi_observed: on-the-fly from GQ (512×512, 250 m)
-        b01      = raw["sur_refl_b01"][date][grid_id][:].astype(np.float32)
-        b02      = raw["sur_refl_b02"][date][grid_id][:].astype(np.float32)
+        # ndvi_observed: on-the-fly from the raw red/NIR bands. reproject() works in
+        # the MOD09GQ 250 m frame (PATCH_PX=512); a MOD09GA 500 m raw zarr stores
+        # 256×256 patches, so upsample those 2× like the processed bands below.
+        # (Without this every band was sampled on a 256-px extent — only the
+        # top-left quarter of the target received MODIS data, the rest was 0.)
+        b01 = raw["sur_refl_b01"][date][grid_id][:].astype(np.float32)
+        b02 = raw["sur_refl_b02"][date][grid_id][:].astype(np.float32)
+        if b01.shape[-1] == self.PATCH_PX // 2:
+            b01, b02 = upsample_500_to_250(b01), upsample_500_to_250(b02)
         ndvi_obs = np.asarray(compute_ndvi(b02, b01, fill_below=-0.05), dtype=np.float32)
 
         # ndvi_envelope + soft_score from GA-processed zarr (256×256, 500 m).
@@ -165,8 +171,14 @@ class MODISSource(AncillarySource):
         col0: int,
         target_grid: TargetGrid,
     ) -> dict[str, np.ndarray]:
+        shapes = {k: tuple(v.shape[-2:]) for k, v in bands.items()}
+        if len(set(shapes.values())) != 1 or next(iter(shapes.values())) != (self.PATCH_PX, self.PATCH_PX):
+            raise ValueError(
+                f"MODISSource.reproject: every band must be {self.PATCH_PX}×{self.PATCH_PX} "
+                f"(250 m frame), got {shapes}"
+            )
         lat, lon = _aeqd_to_latlon(target_grid)
-        h, w = next(iter(bands.values())).shape[-2:]
+        h, w = self.PATCH_PX, self.PATCH_PX
         frac_row, frac_col = _latlon_to_modis_px(lat, lon, row0, col0, h, w)
         return {k: _sample_array(v, frac_row, frac_col) for k, v in bands.items()}
 
@@ -547,7 +559,10 @@ class LAISource(AncillarySource):
     pass ``fpar_band="Fpar_500m"`` explicitly to also load FAPAR.
     """
 
-    PATCH_PX: int = 256
+    # Coordinates are computed in the MOD09GQ 250 m frame (like MODISSource): a 512-px patch.
+    # MCD15A3H is stored as 256×256 at 500 m, so load() upsamples every band 2×.
+    # (With PATCH_PX=256 the whole 118 km patch was squeezed into the central 59 km.)
+    PATCH_PX: int = 512
 
     def __init__(
         self,
@@ -616,6 +631,9 @@ class LAISource(AncillarySource):
             out["fpar"] = fpar
             out["fpar_qc"] = (~(qc_bad | ~np.isfinite(fpar))).astype(np.float32)
 
+        # 500 m (256 px) → 250 m frame (512 px) so reproject() maps the full footprint
+        if lai.shape[-1] == self.PATCH_PX // 2:
+            out = {k: upsample_500_to_250(v) for k, v in out.items()}
         return out
 
     def patch_origin(self, lat: float, lon: float) -> tuple[int, int]:
@@ -628,7 +646,13 @@ class LAISource(AncillarySource):
         col0: int,
         target_grid: TargetGrid,
     ) -> dict[str, np.ndarray]:
+        shapes = {k: tuple(v.shape[-2:]) for k, v in bands.items()}
+        if len(set(shapes.values())) != 1 or next(iter(shapes.values())) != (self.PATCH_PX, self.PATCH_PX):
+            raise ValueError(
+                f"LAISource.reproject: every band must be {self.PATCH_PX}×{self.PATCH_PX} "
+                f"(250 m frame), got {shapes}"
+            )
         lat, lon = _aeqd_to_latlon(target_grid)
-        h, w = next(iter(bands.values())).shape[-2:]
+        h, w = self.PATCH_PX, self.PATCH_PX
         frac_row, frac_col = _latlon_to_modis_px(lat, lon, row0, col0, h, w)
         return {k: _sample_array(v, frac_row, frac_col) for k, v in bands.items()}
