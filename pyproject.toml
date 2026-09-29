@@ -6,6 +6,7 @@ authors = [
   { name = "Riccardo D'Ercole" }
 ]
 readme = "README.md"
+license = { file = "LICENSE.txt" }
 requires-python = ">=3.11, <3.14"
 
 # `majortom` (MajorTOM grid definitions, used by transform/majortom.py) is not published
@@ -58,6 +59,17 @@ dev = ["pytest>=8.0.0"]
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+# Without an explicit include list, hatchling's default sdist file selection walks the
+# entire project root -- on this repo that includes `data/` (hundreds of thousands of
+# files across several huge Zarr stores), which makes the build hang for a very long time
+# on an NFS-backed filesystem. Restricting to what the package actually needs avoids that.
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/modis_majortom",
+    "README.md",
+    "LICENSE.txt",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/modis_majortom"]

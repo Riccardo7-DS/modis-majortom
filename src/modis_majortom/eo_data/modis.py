@@ -29,7 +29,10 @@ import ee, geemap
 from datetime import datetime, timedelta
 from pystac_client import Client
 import pyproj
-from majortom import Grid
+try:
+    from majortom import Grid
+except ImportError:
+    Grid = None  # not on PyPI; only needed for global-AOI grid generation, see _generate_global_aoi
 import zarr
 import json
 import time
@@ -1807,6 +1810,12 @@ class EarthAccessDownloader:
 
         logger.info(f"🗺️ Generating global AOI with patch size {calculations['patch_size_km']:.2f} km, grid spacing {calculations['grid_spacing_km']:.2f} km, overlap {calculations['overlap_km']:.2f} km, gap {calculations['gap_km']:.2f} km")
 
+        if Grid is None:
+            raise ImportError(
+                "Global AOI generation requires the `majortom` package, which is not on "
+                "PyPI. Install it with: "
+                'pip install "majortom @ git+https://github.com/ESA-PhiLab/Major-TOM.git"'
+            )
         self.grid = Grid(dist=calculations["grid_spacing_km"])
 
         if not generate_global:
